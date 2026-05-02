@@ -204,6 +204,504 @@
     };
 
     // ============================================================
+    // ANTHROPIC API — Fase 2: Synergy Engine
+    // ============================================================
+
+    const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
+    const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
+    const CACHE_PREFIX = 'mtg_eval_';
+
+    function getApiKey() {
+      return localStorage.getItem('anthropic_api_key') || '';
+    }
+    function setApiKeyStorage(key) {
+      if (key) localStorage.setItem('anthropic_api_key', key);
+      else localStorage.removeItem('anthropic_api_key');
+    }
+    function loadFromCache(key) {
+      try {
+        const v = localStorage.getItem(CACHE_PREFIX + key);
+        return v ? JSON.parse(v) : null;
+      } catch { return null; }
+    }
+    function saveToCache(key, value) {
+      try { localStorage.setItem(CACHE_PREFIX + key, JSON.stringify(value)); }
+      catch (e) { console.warn('Cache write failed:', e); }
+    }
+
+    async function callClaude(apiKey, systemPrompt, userPrompt, maxTokens = 2000) {
+      const res = await fetch(ANTHROPIC_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: ANTHROPIC_MODEL,
+          max_tokens: maxTokens,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userPrompt }],
+        }),
+      });
+      if (!res.ok) {
+        let errMsg = `Errore API ${res.status}`;
+        try {
+          const err = await res.json();
+          if (err.error?.message) errMsg += `: ${err.error.message}`;
+        } catch {}
+        throw new Error(errMsg);
+      }
+      const json = await res.json();
+      const textBlock = json.content?.find(b => b.type === 'text');
+      if (!textBlock) throw new Error('Risposta Claude vuota');
+      return textBlock.text;
+    }
+
+    function extractJsonFromResponse(text) {
+      let cleaned = text.trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '');
+      const objStart = cleaned.indexOf('{');
+      const arrStart = cleaned.indexOf('[');
+      let start = -1;
+      if (objStart === -1) start = arrStart;
+      else if (arrStart === -1) start = objStart;
+      else start = Math.min(objStart, arrStart);
+      if (start === -1) throw new Error('Nessun JSON trovato nella risposta');
+      cleaned = cleaned.slice(start);
+      try { return JSON.parse(cleaned); }
+      catch {
+        for (let i = cleaned.length - 1; i > 0; i--) {
+          if (cleaned[i] === '}' || cleaned[i] === ']') {
+            try { return JSON.parse(cleaned.slice(0, i + 1)); }
+            catch { continue; }
+          }
+        }
+        throw new Error('Impossibile parsare il JSON dalla risposta di Claude');
+      }
+    }
+
+    async function extractCommanderProfile(commander, apiKey) {
+      const sys = `Sei un esperto di Magic: The Gathering, formato Commander. Estrai il profilo strategico di un comandante in JSON strutturato. Rispondi SOLO con JSON valido, senza testo extra né markdown fences.`;
+      const usr = `Comandante: ${commander.name}
+Color Identity: ${(commander.color_identity || []).join('') || 'C'}
+Tipo: ${commander.type_line}
+Costo: ${commander.mana_cost}
+Testo Oracle: ${commander.oracle_text}
+
+Estrai il profilo del comandante in questo JSON (in italiano, descrizioni concise):
+{
+  "primary_strategy": "una frase: cosa fa il commander e come spinge a vincere",
+  "key_mechanics": ["meccaniche chiave: es. sacrifice, graveyard, tokens, +1/+1 counters"],
+  "cared_about_types": ["tipi creatura/permanente rilevanti, es. Wolf, Human, Artifact"],
+  "cared_about_keywords": ["keyword rilevanti, es. flying, menace, lifelink"],
+  "needs_to_function": ["cosa serve sul tavolo per far girare il commander"],
+  "payoffs": ["cosa fa quando attiva/triggera"],
+  "vulnerabilities": ["debolezze: es. removal su commander, odio cimitero"]
+}`;
+      const text = await callClaude(apiKey, sys, usr, 1000);
+      return extractJsonFromResponse(text);
+    }
+
+    async function scoreSynergiesBatch(cards, commander, profile, archetype, apiKey, onProgress) {
+      const archetypeLabel = ARCHETYPES[archetype]?.label || archetype;
+      const BATCH_SIZE = 17;
+      const BASIC_LANDS = ['plains','island','swamp','mountain','forest','wastes',
+        'snow-covered plains','snow-covered island','snow-covered swamp',
+        'snow-covered mountain','snow-covered forest'];
+      const toEvaluate = cards.filter(c =>
+        !c.isCommander && !BASIC_LANDS.includes(c.name.toLowerCase())
+      );
+      const results = {};
+      const batches = [];
+      for (let i = 0; i < toEvaluate.length; i += BATCH_SIZE) {
+        batches.push(toEvaluate.slice(i, i + BATCH_SIZE));
+      }
+
+      const sys = `Sei un esperto di Magic: The Gathering Commander. Valuti la sinergia di carte rispetto a un comandante specifico. Sii rigoroso: l'utility generico (Sol Ring, Counterspell base, Swords to Plowshares) NON è sinergia, è goodstuff e va categorizzato come utility_generic. La sinergia vera è specifica al comandante e all'archetipo dichiarato. Rispondi SOLO con JSON valido, senza markdown fences né testo extra.`;
+
+      for (let bi = 0; bi < batches.length; bi++) {
+        if (onProgress) onProgress(bi, batches.length);
+        const batch = batches[bi];
+        const cardList = batch.map((c, i) =>
+          `${i+1}. ${c.name} | ${c.type_line || '?'} | CMC ${c.cmc} | ${c.oracle_text || '(no text)'}`
+        ).join('\n');
+
+        const usr = `COMANDANTE: ${commander.name}
+PROFILO COMMANDER: ${JSON.stringify(profile)}
+ARCHETIPO DICHIARATO: ${archetypeLabel}
+
+Per ogni carta, valuta sinergia con questo comandante in questo archetipo (0-10):
+- 10 = pezzo chiave imprescindibile per la strategia
+- 8-9 = amplificatore forte e specifico
+- 6-7 = utile in tema ma non specifico per QUESTO commander
+- 4-5 = filler accettabile, no sinergia specifica
+- 1-3 = debole o off-theme
+- 0 = misfit completo
+
+Categoria (UNA sola):
+- enabler = abilita direttamente la strategia del commander
+- amplifier = amplifica/moltiplica i payoff del commander
+- protector = protegge il commander o la strategia
+- tribal = condivide tipo creatura rilevante per il commander
+- utility_generic = utile ma generico, no sinergia specifica
+- redundant = ridondante con altre carte simili nel mazzo
+- misfit = non adatto al deck, da tagliare
+
+JSON array, una entry per carta nello stesso ordine, schema:
+[{"n":1,"name":"...","score":0-10,"category":"...","why":"max 12 parole italiano"}]
+
+CARTE:
+${cardList}`;
+
+        try {
+          const text = await callClaude(apiKey, sys, usr, 3500);
+          const parsed = extractJsonFromResponse(text);
+          if (Array.isArray(parsed)) {
+            parsed.forEach(entry => {
+              const cardName = entry.name;
+              const match = batch.find(c => c.name.toLowerCase() === (cardName || '').toLowerCase())
+                         || batch[entry.n - 1];
+              if (match) {
+                results[match.name] = {
+                  score: typeof entry.score === 'number' ? entry.score : 5,
+                  category: entry.category || 'utility_generic',
+                  reasoning: entry.why || entry.reasoning || '',
+                };
+              }
+            });
+          }
+        } catch (e) {
+          console.error(`Batch ${bi} failed:`, e);
+        }
+        await new Promise(r => setTimeout(r, 200));
+      }
+      if (onProgress) onProgress(batches.length, batches.length);
+      return results;
+    }
+
+    // ============================================================
+    // COMPONENTI FASE 2 — Modal API key + Tab Sinergie
+    // ============================================================
+
+    function ApiKeyModal({ open, onClose, onSave }) {
+      const [key, setKey] = useState(getApiKey());
+      const [testing, setTesting] = useState(false);
+      const [error, setError] = useState('');
+      if (!open) return null;
+
+      const handleSave = async () => {
+        const trimmed = key.trim();
+        if (!trimmed.startsWith('sk-ant-')) {
+          setError('La chiave deve iniziare con "sk-ant-"');
+          return;
+        }
+        setTesting(true);
+        setError('');
+        try {
+          await callClaude(trimmed, 'Rispondi solo con la parola: ok', 'test', 10);
+          setApiKeyStorage(trimmed);
+          setTesting(false);
+          onSave(trimmed);
+        } catch (e) {
+          setTesting(false);
+          setError(`Test fallito: ${e.message}`);
+        }
+      };
+
+      return (
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-xl max-w-lg w-full p-6">
+            <h3 className="text-lg font-semibold mb-2">Chiave API Anthropic</h3>
+            <p className="text-sm text-zinc-400 mb-4">
+              Per analizzare le sinergie serve la tua chiave Claude. Resta solo nel tuo browser, non lascia mai il computer.
+            </p>
+            <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3 mb-4 text-xs text-zinc-400">
+              <strong className="text-zinc-300">Come ottenerla:</strong>
+              <ol className="list-decimal list-inside mt-1 space-y-0.5">
+                <li>Vai su <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer" className="text-amber-400 underline">console.anthropic.com/settings/keys</a></li>
+                <li>"Create Key", dai un nome, copiala</li>
+                <li>Incollala qui sotto (inizia con sk-ant-)</li>
+              </ol>
+            </div>
+            <input
+              type="password"
+              value={key}
+              onChange={e => setKey(e.target.value)}
+              placeholder="sk-ant-..."
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-2.5 text-sm font-mono focus:outline-none focus:border-amber-500/50"
+            />
+            {error && <div className="mt-2 text-xs text-red-400">{error}</div>}
+            <div className="flex gap-2 mt-4">
+              <button onClick={onClose} className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-sm">Annulla</button>
+              <button
+                onClick={handleSave}
+                disabled={testing || !key.trim()}
+                className="flex-1 bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-black font-semibold py-2 rounded-lg"
+              >
+                {testing ? 'Verifico la chiave...' : 'Salva e verifica'}
+              </button>
+            </div>
+            <p className="text-[10px] text-zinc-600 mt-3">
+              La chiave viene testata con una micro-chiamata (frazione di centesimo) per essere sicuri che funzioni.
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    function ApiKeyIndicator({ apiKey, onClick }) {
+      const has = !!apiKey;
+      return (
+        <button onClick={onClick}
+          className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg border ${
+            has ? 'bg-emerald-950/40 border-emerald-800/50 text-emerald-300 hover:bg-emerald-950/60'
+                : 'bg-zinc-900 border-zinc-700 text-zinc-400 hover:bg-zinc-800'
+          }`}>
+          <span>{has ? '🔑' : '🔓'}</span>
+          <span>{has ? 'Chiave Claude attiva' : 'Chiave Claude non impostata'}</span>
+        </button>
+      );
+    }
+
+    function SynergyStatBlock({ label, value, sub, highlight, warning }) {
+      return (
+        <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3">
+          <div className="text-xs text-zinc-500">{label}</div>
+          <div className="flex items-baseline gap-1">
+            <span className={`text-2xl font-bold ${highlight ? 'text-emerald-400' : warning ? 'text-amber-400' : 'text-zinc-100'}`}>
+              {value}
+            </span>
+            <span className="text-xs text-zinc-600">{sub}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function SynergyCardRow({ card }) {
+      const score = card.synergy.score || 0;
+      const cat = card.synergy.category;
+      const why = card.synergy.reasoning;
+      const catColors = {
+        enabler:        'bg-emerald-900/40 text-emerald-300 border-emerald-700/30',
+        amplifier:      'bg-emerald-900/40 text-emerald-300 border-emerald-700/30',
+        protector:      'bg-blue-900/40 text-blue-300 border-blue-700/30',
+        tribal:         'bg-purple-900/40 text-purple-300 border-purple-700/30',
+        utility_generic:'bg-zinc-800 text-zinc-300 border-zinc-700',
+        redundant:      'bg-amber-900/40 text-amber-300 border-amber-700/30',
+        misfit:         'bg-red-900/40 text-red-300 border-red-700/30',
+      };
+      const scoreColor = score >= 8 ? 'text-emerald-400'
+        : score >= 6 ? 'text-amber-400'
+        : score >= 4 ? 'text-zinc-400'
+        : 'text-red-400';
+      return (
+        <div className="flex items-center gap-3 py-2 px-2 hover:bg-zinc-800/40 rounded">
+          <div className={`text-lg font-bold w-10 text-right ${scoreColor}`}>{score}</div>
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium truncate">
+              <a href={card.scryfall_uri} target="_blank" rel="noreferrer" className="hover:text-amber-400">{card.name}</a>
+            </div>
+            <div className="text-xs text-zinc-500 truncate" title={why}>{why}</div>
+          </div>
+          <span className={`text-[10px] px-2 py-0.5 rounded border whitespace-nowrap ${catColors[cat] || catColors.utility_generic}`}>
+            {cat}
+          </span>
+        </div>
+      );
+    }
+
+    function SynergyResults({ synergies, cards, commander, onRerun }) {
+      const [filter, setFilter] = useState('all');
+      const profile = synergies.profile || {};
+      const scores = synergies.scores || {};
+
+      const enriched = cards
+        .filter(c => !c.isCommander && scores[c.name])
+        .map(c => ({ ...c, synergy: scores[c.name] }))
+        .sort((a, b) => (b.synergy.score || 0) - (a.synergy.score || 0));
+
+      const byCat = (cat) => enriched.filter(c => c.synergy.category === cat);
+      const byCategory = {
+        enabler: byCat('enabler'),
+        amplifier: byCat('amplifier'),
+        protector: byCat('protector'),
+        tribal: byCat('tribal'),
+        utility_generic: byCat('utility_generic'),
+        redundant: byCat('redundant'),
+        misfit: byCat('misfit'),
+      };
+      const filtered = filter === 'all' ? enriched : enriched.filter(c => c.synergy.category === filter);
+      const avgScore = enriched.length > 0
+        ? enriched.reduce((s, c) => s + (c.synergy.score || 0), 0) / enriched.length
+        : 0;
+
+      return (
+        <div className="space-y-6">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+            <div className="flex items-start justify-between mb-3">
+              <h3 className="text-sm font-semibold text-zinc-300">Profilo del comandante (analisi Claude)</h3>
+              <button onClick={onRerun} className="text-xs text-zinc-500 hover:text-zinc-300">↻ Rianalizza</button>
+            </div>
+            <div className="grid md:grid-cols-2 gap-4 text-sm">
+              <div className="md:col-span-2">
+                <div className="text-xs text-zinc-500 mb-1">Strategia primaria</div>
+                <div className="text-zinc-200">{profile.primary_strategy || '—'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500 mb-1">Meccaniche chiave</div>
+                <div className="flex flex-wrap gap-1">
+                  {(profile.key_mechanics || []).map((m, i) => (
+                    <span key={i} className="text-xs bg-amber-900/30 text-amber-300 px-2 py-0.5 rounded">{m}</span>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500 mb-1">Tipi/keyword chiave</div>
+                <div className="flex flex-wrap gap-1">
+                  {[...(profile.cared_about_types||[]), ...(profile.cared_about_keywords||[])].map((m, i) => (
+                    <span key={i} className="text-xs bg-purple-900/30 text-purple-300 px-2 py-0.5 rounded">{m}</span>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500 mb-1">Cosa serve per funzionare</div>
+                <ul className="text-zinc-300 text-sm list-disc list-inside space-y-0.5">
+                  {(profile.needs_to_function || []).map((n, i) => <li key={i}>{n}</li>)}
+                </ul>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500 mb-1">Vulnerabilità</div>
+                <ul className="text-zinc-300 text-sm list-disc list-inside space-y-0.5">
+                  {(profile.vulnerabilities || []).map((v, i) => <li key={i}>{v}</li>)}
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+            <h3 className="text-sm font-semibold mb-4 text-zinc-300">Distribuzione delle sinergie</h3>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <SynergyStatBlock label="Score medio" value={avgScore.toFixed(1)} sub="/ 10" highlight={avgScore >= 6.5} warning={avgScore < 5} />
+              <SynergyStatBlock label="Enabler + Amplifier" value={byCategory.enabler.length + byCategory.amplifier.length} sub="carte chiave" highlight />
+              <SynergyStatBlock label="Utility generici" value={byCategory.utility_generic.length} sub="goodstuff" />
+              <SynergyStatBlock label="Misfit + Ridondanti" value={byCategory.misfit.length + byCategory.redundant.length} sub="candidati taglio" warning={byCategory.misfit.length + byCategory.redundant.length > 5} />
+            </div>
+          </div>
+
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+            <h3 className="text-sm font-semibold mb-3 text-zinc-300">Carte per categoria di sinergia</h3>
+            <div className="flex flex-wrap gap-1.5 mb-4">
+              {[
+                ['all', `Tutte (${enriched.length})`],
+                ['enabler', `Enabler (${byCategory.enabler.length})`],
+                ['amplifier', `Amplifier (${byCategory.amplifier.length})`],
+                ['protector', `Protector (${byCategory.protector.length})`],
+                ['tribal', `Tribal (${byCategory.tribal.length})`],
+                ['utility_generic', `Utility (${byCategory.utility_generic.length})`],
+                ['redundant', `Ridondanti (${byCategory.redundant.length})`],
+                ['misfit', `Misfit (${byCategory.misfit.length})`],
+              ].map(([k, label]) => (
+                <button key={k} onClick={() => setFilter(k)}
+                  className={`px-3 py-1 text-xs rounded-full ${filter===k ? 'bg-amber-500 text-black font-medium' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="max-h-[500px] overflow-y-auto scrollbar-thin space-y-0.5">
+              {filtered.map((c, i) => (<SynergyCardRow key={i} card={c} />))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function SynergyTab({ analysis, data, apiKey, onApiKeyMissing, synergies, setSynergies }) {
+      const [running, setRunning] = useState(false);
+      const [progress, setProgress] = useState({ current: 0, total: 0, phase: '' });
+      const [error, setError] = useState('');
+
+      const cacheKey = `synergies_${data.commander?.name}_${data.archetype}`;
+
+      const handleRun = async () => {
+        if (!apiKey) { onApiKeyMissing(); return; }
+        setRunning(true);
+        setError('');
+        try {
+          setProgress({ current: 0, total: 0, phase: 'Estraggo il profilo del comandante...' });
+          const profile = await extractCommanderProfile(data.commander, apiKey);
+
+          setProgress({ current: 0, total: 1, phase: 'Analizzo le sinergie carta per carta...' });
+          const scores = await scoreSynergiesBatch(
+            analysis.all_cards,
+            data.commander,
+            profile,
+            data.archetype,
+            apiKey,
+            (curr, total) => setProgress({ current: curr, total, phase: 'Analizzo le sinergie carta per carta...' })
+          );
+
+          const result = { profile, scores };
+          setSynergies(result);
+          saveToCache(cacheKey, result);
+          setRunning(false);
+        } catch (e) {
+          setError(e.message);
+          setRunning(false);
+        }
+      };
+
+      const handleClearCache = () => {
+        localStorage.removeItem(CACHE_PREFIX + cacheKey);
+        setSynergies(null);
+      };
+
+      if (running) {
+        return (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-8 text-center">
+            <div className="inline-block w-10 h-10 border-4 border-amber-500/30 border-t-amber-500 rounded-full animate-spin mb-4"></div>
+            <div className="text-zinc-300 font-medium mb-1">{progress.phase}</div>
+            {progress.total > 0 && (
+              <div className="text-xs text-zinc-500">
+                Batch {progress.current} di {progress.total}
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      if (synergies) {
+        return <SynergyResults synergies={synergies} cards={analysis.all_cards} commander={data.commander} onRerun={handleClearCache} />;
+      }
+
+      return (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-8 text-center">
+          <h3 className="text-lg font-semibold mb-2">Analisi sinergie con Claude</h3>
+          <p className="text-sm text-zinc-400 mb-2 max-w-md mx-auto">
+            Claude leggerà ogni carta del mazzo e valuterà quanto è davvero sinergica con <strong className="text-zinc-200">{data.commander?.name}</strong> nell'archetipo <strong className="text-zinc-200">{ARCHETYPES[data.archetype].label}</strong>.
+          </p>
+          <p className="text-xs text-zinc-500 mb-6">
+            Tempo: ~30-60 secondi · Costo stimato: ~10-15 centesimi · Risultato salvato in cache locale
+          </p>
+          {!apiKey && (
+            <p className="text-xs text-amber-400 mb-4">
+              Prima serve la tua chiave Anthropic. Cliccando il bottone te la chiederò.
+            </p>
+          )}
+          <button
+            onClick={handleRun}
+            className="bg-amber-500 hover:bg-amber-400 text-black font-semibold px-6 py-2.5 rounded-lg"
+          >
+            {apiKey ? 'Analizza sinergie' : 'Imposta chiave e analizza'}
+          </button>
+          {error && <div className="mt-4 text-sm text-red-400">{error}</div>}
+        </div>
+      );
+    }
+
+    // ============================================================
     // FUNCTION TAGGING
     // analizza il testo della carta e applica tag funzionali
     // ============================================================
@@ -882,7 +1380,8 @@
       );
     }
 
-    function ResultsView({ data, analysis, scores, onReset }) {
+    function ResultsView({ data, analysis, scores, onReset, apiKey, onApiKeyMissing, synergies, setSynergies }) {
+      const [tab, setTab] = useState('overview');
       const dimNames = {
         mana_base: 'Mana base',
         ramp: 'Ramp',
@@ -920,6 +1419,32 @@
             </div>
             <button onClick={onReset} className="text-sm text-zinc-400 hover:text-zinc-200">← Nuova analisi</button>
           </div>
+
+          {/* Tab navigation */}
+          <div className="flex gap-1 border-b border-zinc-800">
+            <button
+              onClick={() => setTab('overview')}
+              className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px ${
+                tab === 'overview'
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              Panoramica
+            </button>
+            <button
+              onClick={() => setTab('synergy')}
+              className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px flex items-center gap-2 ${
+                tab === 'synergy'
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              Sinergie {synergies && <span className="text-emerald-400 text-xs">●</span>}
+            </button>
+          </div>
+
+          {tab === 'overview' && (<React.Fragment>
 
           {/* Top row: Overall + Radar */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -1044,6 +1569,19 @@
 
           {/* Tabella carte taggate */}
           <CardsBreakdown cards={analysis.all_cards} />
+
+          </React.Fragment>)}
+
+          {tab === 'synergy' && (
+            <SynergyTab
+              analysis={analysis}
+              data={data}
+              apiKey={apiKey}
+              onApiKeyMissing={onApiKeyMissing}
+              synergies={synergies}
+              setSynergies={setSynergies}
+            />
+          )}
         </div>
       );
     }
@@ -1209,6 +1747,19 @@
       const [analysis, setAnalysis] = useState(null);
       const [scores, setScores] = useState(null);
       const [error, setError] = useState('');
+      const [apiKey, setApiKeyState] = useState(getApiKey());
+      const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+      const [synergies, setSynergies] = useState(null);
+
+      // Quando arriviamo alla schermata risultati, prova a caricare le sinergie dalla cache
+      useEffect(() => {
+        if (phase === 'results' && data?.commander) {
+          const cacheKey = `synergies_${data.commander.name}_${data.archetype}`;
+          const cached = loadFromCache(cacheKey);
+          if (cached) setSynergies(cached);
+          else setSynergies(null);
+        }
+      }, [phase, data]);
 
       const handleAnalyze = async (parsedData) => {
         setPhase('fetching');
@@ -1281,18 +1832,22 @@
         setData(null);
         setAnalysis(null);
         setScores(null);
+        setSynergies(null);
         setError('');
       };
 
       return (
         <div className="min-h-screen p-4 md:p-8">
-          <header className="max-w-6xl mx-auto mb-8">
-            <h1 className="text-2xl md:text-3xl font-bold tracking-tight">
-              Commander Deck Evaluator
-            </h1>
-            <p className="text-sm text-zinc-400 mt-1">
-              Analisi euristica di mazzi Commander · Scryfall + euristiche per archetipo
-            </p>
+          <header className="max-w-6xl mx-auto mb-8 flex items-start justify-between gap-4">
+            <div>
+              <h1 className="text-2xl md:text-3xl font-bold tracking-tight">
+                Commander Deck Evaluator
+              </h1>
+              <p className="text-sm text-zinc-400 mt-1">
+                Analisi euristica di mazzi Commander · Scryfall + euristiche per archetipo
+              </p>
+            </div>
+            <ApiKeyIndicator apiKey={apiKey} onClick={() => setShowApiKeyModal(true)} />
           </header>
 
           <main className="max-w-6xl mx-auto">
@@ -1303,13 +1858,28 @@
             {phase === 'confirm' && data && <ConfirmStep data={data} onConfirm={handleConfirm} onBack={handleReset} />}
             {phase === 'analyzing' && <LoadingScreen message="Sto analizzando il mazzo…" />}
             {phase === 'results' && analysis && scores && (
-              <ResultsView data={data} analysis={analysis} scores={scores} onReset={handleReset} />
+              <ResultsView
+                data={data}
+                analysis={analysis}
+                scores={scores}
+                onReset={handleReset}
+                apiKey={apiKey}
+                onApiKeyMissing={() => setShowApiKeyModal(true)}
+                synergies={synergies}
+                setSynergies={setSynergies}
+              />
             )}
             {phase === 'error' && <ErrorScreen error={error} onBack={handleReset} />}
           </main>
 
+          <ApiKeyModal
+            open={showApiKeyModal}
+            onClose={() => setShowApiKeyModal(false)}
+            onSave={(k) => { setApiKeyState(k); setShowApiKeyModal(false); }}
+          />
+
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.1 MVP · Dati: Scryfall · Prezzi in euro da Cardmarket via Scryfall
+            v0.2 · Synergy engine · Scryfall + Claude · Prezzi via Cardmarket
           </footer>
         </div>
       );
