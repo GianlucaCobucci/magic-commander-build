@@ -1974,8 +1974,314 @@ JSON:
     }
 
     // ============================================================
+    // MODIFICA POST-GENERAZIONE
+    // ============================================================
+
+    // Chiede a Claude un diff strutturato in base alla richiesta dell'utente
+    async function proposeDeckModification({
+      currentDeck, // generated object completo
+      userRequest, // testo libero italiano
+      apiKey,
+      onProgress,
+    }) {
+      if (onProgress) onProgress({ phase: 'Claude analizza la modifica richiesta...', step: 1, total: 3 });
+
+      const cmdr = currentDeck.commander_data || { name: currentDeck.commander_name };
+      const archCtx = currentDeck.archetype_context || {};
+      const allCards = currentDeck.cards || [];
+
+      const cardListForPrompt = allCards.map(c =>
+        `- ${c.name} | ${c.category} | ${c.why || ''}`
+      ).join('\n');
+
+      const sys = `Sei un esperto costruttore di mazzi MTG Commander. L'utente ha generato una decklist e ti chiede di modificarla. Tu proponi un DIFF strutturato (carte da togliere + carte da aggiungere) in modo che la lista finale rimanga di 99 carte (non commander) e rispetti la strategia. Ragiona come un giocatore esperto: se l'utente chiede "più draw togli ramp", scegli tu il ramp meno utile e il draw più sinergico per QUESTO commander. Rispondi SOLO con JSON valido, niente markdown.`;
+
+      const usr = `COMANDANTE: ${cmdr.name}
+COLOR IDENTITY: ${(cmdr.color_identity || []).join('') || 'C'}
+STRATEGIA: ${archCtx.full_context || archCtx.label || 'midrange'}
+BRACKET: ${currentDeck.bracket_target}
+
+LISTA ATTUALE (${allCards.length} carte non commander):
+${cardListForPrompt}
+
+RICHIESTA DELL'UTENTE:
+${userRequest}
+
+Proponi un diff per soddisfare la richiesta:
+- to_remove: carte ESATTE da togliere (devono esistere nella lista attuale, scrivi i nomi esatti)
+- to_add: carte nuove da aggiungere (legali nella color identity, non già nel mazzo)
+- Mantieni il totale a 99 carte non commander: |to_remove| deve essere uguale a |to_add|
+- Spiega perché ogni cambio aiuta la richiesta
+- Spiega in 2-3 frasi come questa modifica cambia il mazzo
+
+Rispondi con JSON ESATTO:
+{
+  "summary": "2-3 frasi italiano: cosa cambia e perché",
+  "to_remove": [
+    {"name": "Nome esatto carta in lista", "why": "perché tolgo (max 12 parole italiano)"}
+  ],
+  "to_add": [
+    {"name": "Nome nuova carta", "category": "land|ramp|draw|removal|threat|protection|win_con|engine|utility|tribal|combo_piece|tutor", "why": "perché aggiungo (max 15 parole italiano)", "referenced_synergies": ["altra carta del mazzo"]}
+  ]
+}`;
+
+      const text = await callClaude(apiKey, sys, usr, 3000);
+      const parsed = extractJsonFromResponse(text);
+
+      if (!Array.isArray(parsed.to_remove) || !Array.isArray(parsed.to_add)) {
+        throw new Error('Diff non valido restituito da Claude');
+      }
+
+      // Verifica che to_remove esista nel mazzo (case-insensitive)
+      const currentNames = new Set(allCards.map(c => c.name.toLowerCase()));
+      const validRemove = parsed.to_remove.filter(r => {
+        if (!r.name) return false;
+        return currentNames.has(r.name.toLowerCase());
+      });
+
+      // Verifica che to_add NON sia già nel mazzo
+      const validAdd = parsed.to_add.filter(a => {
+        if (!a.name) return false;
+        return !currentNames.has(a.name.toLowerCase());
+      });
+
+      if (onProgress) onProgress({ phase: 'Verifico le carte nuove su Scryfall...', step: 2, total: 3 });
+
+      // Verifica le nuove carte su Scryfall
+      const newNames = validAdd.map(a => a.name);
+      const { fetched: newFetched, notFound: newNotFound } = await fetchCardsFromScryfall(newNames);
+
+      validAdd.forEach(a => {
+        const sc = newFetched[a.name.toLowerCase()];
+        a.found = !!sc;
+        a.card_data = sc ? normalizeCard(sc, a.name, false) : null;
+      });
+
+      if (onProgress) onProgress({ phase: 'Diff pronto', step: 3, total: 3 });
+
+      return {
+        summary: parsed.summary || '',
+        to_remove: validRemove,
+        to_add: validAdd,
+        not_found: newNotFound,
+        balance_warning: validRemove.length !== validAdd.length
+          ? `Squilibrio: ${validRemove.length} da togliere vs ${validAdd.length} da aggiungere. La lista finale non avrà 99 carte.`
+          : null,
+        user_request: userRequest,
+      };
+    }
+
+    // Applica un diff confermato al generated, restituendo la nuova versione
+    function applyDiffToGenerated(generated, diff) {
+      const removeNames = new Set(diff.to_remove.map(r => r.name.toLowerCase()));
+      const newCards = generated.cards.filter(c => !removeNames.has(c.name.toLowerCase()));
+
+      diff.to_add.forEach(a => {
+        newCards.push({
+          name: a.name,
+          category: a.category || 'utility',
+          why: a.why || '',
+          referenced_synergies: a.referenced_synergies || [],
+          found: a.found !== false,
+          card_data: a.card_data || null,
+          source: 'modification',
+        });
+      });
+
+      // Cronologia modifiche
+      const history = generated.modification_history || [];
+      history.push({
+        timestamp: new Date().toISOString(),
+        user_request: diff.user_request,
+        summary: diff.summary,
+        removed: diff.to_remove.map(r => r.name),
+        added: diff.to_add.map(a => a.name),
+      });
+
+      return {
+        ...generated,
+        cards: newCards,
+        modification_history: history,
+        last_modified_at: new Date().toISOString(),
+      };
+    }
+
+    // ============================================================
     // COMPONENTI FASE 5 — Tab Generatore
     // ============================================================
+
+    // Componente per la sezione modifica del mazzo
+    function ModificationPanel({ generated, apiKey, onApiKeyMissing, onApplyDiff }) {
+      const [request, setRequest] = useState('');
+      const [diff, setDiff] = useState(null);
+      const [running, setRunning] = useState(false);
+      const [progress, setProgress] = useState({ phase: '', step: 0, total: 0 });
+      const [error, setError] = useState('');
+      const [showHistory, setShowHistory] = useState(false);
+
+      const handleProposeDiff = async () => {
+        if (!apiKey) { onApiKeyMissing(); return; }
+        if (!request.trim() || request.trim().length < 5) {
+          setError('Scrivi una richiesta più dettagliata.');
+          return;
+        }
+        setRunning(true);
+        setError('');
+        setDiff(null);
+        try {
+          const result = await proposeDeckModification({
+            currentDeck: generated,
+            userRequest: request.trim(),
+            apiKey,
+            onProgress: setProgress,
+          });
+          setDiff(result);
+          setRunning(false);
+        } catch (e) {
+          setError(e.message);
+          setRunning(false);
+        }
+      };
+
+      const handleConfirm = () => {
+        if (!diff) return;
+        onApplyDiff(diff);
+        setDiff(null);
+        setRequest('');
+      };
+
+      const handleCancel = () => {
+        setDiff(null);
+        setError('');
+      };
+
+      const history = generated.modification_history || [];
+
+      return (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-semibold text-zinc-300">Modifica il mazzo</h3>
+            {history.length > 0 && (
+              <button onClick={() => setShowHistory(!showHistory)} className="text-xs text-zinc-500 hover:text-zinc-300">
+                {showHistory ? 'Nascondi' : 'Mostra'} cronologia ({history.length})
+              </button>
+            )}
+          </div>
+
+          <p className="text-xs text-zinc-500 mb-3">
+            Scrivi in italiano cosa vuoi cambiare. Claude propone un diff (carte da togliere e aggiungere) che puoi confermare o annullare.
+            <br />
+            <span className="text-zinc-600">Esempi: "aggiungi 3 card draw togliendo i ramp meno utili" · "rendi la curva più bassa, max CMC 4" · "voglio più protezione, almeno 2 carte hexproof"</span>
+          </p>
+
+          {showHistory && history.length > 0 && (
+            <div className="mb-3 bg-zinc-950 border border-zinc-800 rounded-lg p-3 max-h-48 overflow-y-auto scrollbar-thin">
+              <div className="text-xs text-zinc-500 mb-2">Cronologia modifiche:</div>
+              {history.map((h, i) => (
+                <div key={i} className="text-xs text-zinc-400 border-l-2 border-zinc-700 pl-2 mb-2">
+                  <div className="text-zinc-300">«{h.user_request}»</div>
+                  <div className="text-[10px] text-zinc-500">
+                    {new Date(h.timestamp).toLocaleString('it-IT')} · {h.removed.length} tolte / {h.added.length} aggiunte
+                  </div>
+                  <div className="text-[10px] text-zinc-500 mt-0.5">{h.summary}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {!diff && !running && (
+            <div className="space-y-2">
+              <textarea
+                value={request}
+                onChange={e => setRequest(e.target.value)}
+                placeholder="Es: aggiungi 3 carte di card draw togliendo i 3 ramp con sinergia più bassa..."
+                className="w-full h-20 bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm text-zinc-200 resize-none focus:outline-none focus:border-amber-500/50"
+              />
+              <button
+                onClick={handleProposeDiff}
+                disabled={!request.trim()}
+                className="w-full bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-black font-semibold py-2 rounded-lg text-sm"
+              >
+                Proponi modifica
+              </button>
+              <p className="text-[10px] text-zinc-600 text-center">
+                Costo: ~5-15 centesimi · La lista non viene cambiata finché non confermi
+              </p>
+              {error && <div className="text-sm text-red-400">{error}</div>}
+            </div>
+          )}
+
+          {running && (
+            <div className="text-center py-6">
+              <div className="inline-block w-8 h-8 border-4 border-amber-500/30 border-t-amber-500 rounded-full animate-spin mb-2"></div>
+              <div className="text-sm text-zinc-300">{progress.phase}</div>
+            </div>
+          )}
+
+          {diff && (
+            <div className="space-y-3">
+              <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3">
+                <div className="text-xs text-zinc-500 uppercase mb-1">Modifica proposta</div>
+                <p className="text-sm text-zinc-200">{diff.summary}</p>
+                {diff.balance_warning && (
+                  <p className="text-xs text-amber-400 mt-2">⚠ {diff.balance_warning}</p>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="bg-red-950/20 border border-red-900/30 rounded-lg p-3">
+                  <h4 className="text-xs font-semibold text-red-300 mb-2 uppercase">Tolgo ({diff.to_remove.length})</h4>
+                  <div className="space-y-1.5">
+                    {diff.to_remove.map((r, i) => (
+                      <div key={i} className="text-xs">
+                        <div className="font-medium text-red-200">— {r.name}</div>
+                        <div className="text-red-400/70 ml-3">{r.why}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="bg-emerald-950/20 border border-emerald-900/30 rounded-lg p-3">
+                  <h4 className="text-xs font-semibold text-emerald-300 mb-2 uppercase">Aggiungo ({diff.to_add.length})</h4>
+                  <div className="space-y-1.5">
+                    {diff.to_add.map((a, i) => (
+                      <div key={i} className="text-xs">
+                        <div className="font-medium text-emerald-200">
+                          + {a.name}
+                          {a.found === false && <span className="text-red-400 ml-1">(non trovata)</span>}
+                          {a.category && <span className="text-emerald-400/60 text-[10px] ml-1">[{a.category}]</span>}
+                        </div>
+                        <div className="text-emerald-400/70 ml-3">{a.why}</div>
+                        {a.referenced_synergies && a.referenced_synergies.length > 0 && (
+                          <div className="text-[10px] text-emerald-500/60 ml-3 mt-0.5">
+                            sinergia con: {a.referenced_synergies.join(', ')}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={handleCancel}
+                  className="flex-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm font-medium py-2 rounded-lg"
+                >
+                  Annulla
+                </button>
+                <button
+                  onClick={handleConfirm}
+                  className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold py-2 rounded-lg"
+                >
+                  ✓ Conferma e applica
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
 
     function GenerateCardRow({ card, others }) {
       const found = card.found !== false;
@@ -2015,6 +2321,9 @@ JSON:
                 )}
                 {card.source === 'basic' && (
                   <span className="text-[10px] bg-zinc-800 text-zinc-400 border border-zinc-700 px-1.5 py-0.5 rounded uppercase">base</span>
+                )}
+                {card.source === 'modification' && (
+                  <span className="text-[10px] bg-amber-900/40 text-amber-300 border border-amber-700/30 px-1.5 py-0.5 rounded uppercase">modifica</span>
                 )}
                 {!found && <span className="text-[10px] text-red-400">non trovata su Scryfall</span>}
               </div>
@@ -2106,6 +2415,13 @@ JSON:
         navigator.clipboard.writeText(lines.join('\n'));
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
+      };
+
+      const handleApplyDiff = (diff) => {
+        if (!generated) return;
+        const updated = applyDiffToGenerated(generated, diff);
+        setGenerated(updated);
+        saveToCache(cacheKey, updated);
       };
 
       // Carica eventuale cache al cambio mode
@@ -2313,6 +2629,14 @@ JSON:
               ))}
             </div>
           </div>
+
+          {/* Pannello modifica del mazzo */}
+          <ModificationPanel
+            generated={generated}
+            apiKey={apiKey}
+            onApiKeyMissing={onApiKeyMissing}
+            onApplyDiff={handleApplyDiff}
+          />
 
           {/* Toggle vista cards/testo */}
           <div className="flex bg-zinc-900 border border-zinc-800 rounded-lg p-1 max-w-xs">
@@ -4253,7 +4577,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.7 · Generator archetype-aware · Range dinamici per archetipo · Scryfall + Claude + Spellbook + EDHREC
+            v0.8 · Generator + Modifiche post-generazione · Range archetipo dinamici · Scryfall + Claude + Spellbook + EDHREC
           </footer>
         </div>
       );
