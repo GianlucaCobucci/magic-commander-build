@@ -271,16 +271,57 @@
       else start = Math.min(objStart, arrStart);
       if (start === -1) throw new Error('Nessun JSON trovato nella risposta');
       cleaned = cleaned.slice(start);
-      try { return JSON.parse(cleaned); }
-      catch {
-        for (let i = cleaned.length - 1; i > 0; i--) {
-          if (cleaned[i] === '}' || cleaned[i] === ']') {
-            try { return JSON.parse(cleaned.slice(0, i + 1)); }
-            catch { continue; }
-          }
+
+      // Tentativo 1: parse diretto
+      try { return JSON.parse(cleaned); } catch {}
+
+      // Tentativo 2: tronca all'ultima graffa/quadra valida
+      for (let i = cleaned.length - 1; i > 0; i--) {
+        if (cleaned[i] === '}' || cleaned[i] === ']') {
+          try { return JSON.parse(cleaned.slice(0, i + 1)); }
+          catch { continue; }
         }
-        throw new Error('Impossibile parsare il JSON dalla risposta di Claude');
       }
+
+      // Tentativo 3: ripara JSON troncato chiudendo array/oggetti aperti
+      try {
+        let repaired = cleaned;
+        // Rimuovi virgola finale se presente
+        repaired = repaired.replace(/,\s*$/, '');
+        // Rimuovi stringhe non terminate alla fine
+        const lastQuote = repaired.lastIndexOf('"');
+        const afterLastQuote = repaired.slice(lastQuote + 1);
+        if (afterLastQuote.includes('"') === false && afterLastQuote.length > 0 && !/[\}\],]/.test(afterLastQuote.trim())) {
+          // C'è una stringa aperta in coda, troncala
+          repaired = repaired.slice(0, lastQuote);
+          // Rimuovi anche eventuale chiave incompleta tipo  "key":
+          repaired = repaired.replace(/,\s*"[^"]*"\s*:?\s*$/, '');
+          repaired = repaired.replace(/,\s*$/, '');
+        }
+        // Conta parentesi aperte non chiuse e chiudile
+        let depth = 0;
+        let inString = false;
+        let escape = false;
+        const stack = [];
+        for (let i = 0; i < repaired.length; i++) {
+          const ch = repaired[i];
+          if (escape) { escape = false; continue; }
+          if (ch === '\\') { escape = true; continue; }
+          if (ch === '"') { inString = !inString; continue; }
+          if (inString) continue;
+          if (ch === '{' || ch === '[') stack.push(ch);
+          else if (ch === '}') { if (stack[stack.length-1] === '{') stack.pop(); }
+          else if (ch === ']') { if (stack[stack.length-1] === '[') stack.pop(); }
+        }
+        // Chiudi gli aperti
+        while (stack.length > 0) {
+          const open = stack.pop();
+          repaired += (open === '{' ? '}' : ']');
+        }
+        return JSON.parse(repaired);
+      } catch {}
+
+      throw new Error('Impossibile parsare il JSON dalla risposta di Claude (probabilmente troppo lunga)');
     }
 
     async function extractCommanderProfile(commander, apiKey) {
@@ -902,10 +943,13 @@ ${cardList}`;
     }
 
     async function fetchCommanderSpellbookCombos(cards) {
-      // Commander Spellbook API: usiamo l'endpoint find-my-combos
-      // POST con la lista dei nomi carta
+      // Commander Spellbook API - può fallire per CORS, rete, o cambio endpoint.
+      // Non deve mai bloccare il resto dell'app.
       try {
         const cardNames = cards.map(c => c.name);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
+
         const res = await fetch('https://backend.commanderspellbook.com/find-my-combos', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -913,17 +957,17 @@ ${cardList}`;
             commanders: cards.filter(c => c.isCommander).map(c => c.name),
             main: cardNames,
           }),
+          signal: controller.signal,
         });
+        clearTimeout(timeoutId);
+
         if (!res.ok) {
-          // L'API può variare; non fare crashare l'app
           console.warn('Commander Spellbook risposta non ok:', res.status);
-          return [];
+          return { combos: [], error: `Spellbook ha risposto con status ${res.status}` };
         }
         const json = await res.json();
-        // L'API risponde con {results: {included: [...combos]}} o simile a seconda della versione
-        // Normalizziamo per sicurezza
         const combos = json.results?.included || json.included || json.results || [];
-        return combos.map(c => ({
+        const normalized = combos.map(c => ({
           id: c.id,
           name: c.name || (c.uses ? c.uses.map(u => u.card?.name || u.name).join(' + ') : 'Combo'),
           uses: (c.uses || []).map(u => u.card?.name || u.name).filter(Boolean),
@@ -931,9 +975,13 @@ ${cardList}`;
           description: c.description || '',
           notes: c.notes || '',
         })).filter(c => c.uses && c.uses.length > 0);
+        return { combos: normalized, error: null };
       } catch (e) {
-        console.warn('Errore Commander Spellbook:', e);
-        return [];
+        const msg = e.name === 'AbortError'
+          ? 'Timeout (15s)'
+          : (e.message || 'Errore di rete');
+        console.warn('Errore Commander Spellbook:', msg);
+        return { combos: [], error: msg };
       }
     }
 
@@ -988,9 +1036,10 @@ ${cardList}`;
         setError('');
         try {
           const result = await fetchCommanderSpellbookCombos(analysis.all_cards);
-          setCombos(result);
+          setCombos(result.combos);
+          if (result.error) setError(`Spellbook non disponibile: ${result.error}`);
         } catch (e) {
-          setError(e.message);
+          setError(e.message || 'Errore di rete');
           setCombos([]);
         }
         setLoading(false);
@@ -1299,6 +1348,9 @@ ${data.customStrategy}`,
     // ============================================================
 
     // Genera una decklist ottimizzata partendo da zero o ottimizzando una esistente
+    // APPROCCIO IN 2 PASSAGGI per evitare JSON troppo lunghi:
+    // 1. Claude sceglie i 99 nomi (output piccolo, sicuro)
+    // 2. Claude scrive motivazioni in batch da 20 (output piccoli, gestibili)
     async function generateOptimizedDeck({
       commander, archetypeContext, bracketTarget, edhrecPool,
       mode, // 'fromScratch' o 'optimize'
@@ -1308,99 +1360,145 @@ ${data.customStrategy}`,
     }) {
       const colorIdentity = (commander.color_identity || []).join('') || 'C';
 
-      if (onProgress) onProgress({ phase: 'Preparo il pool di carte da EDHREC...', step: 1, total: 4 });
+      if (onProgress) onProgress({ phase: 'Preparo il pool di carte da EDHREC...', step: 1, total: 5 });
 
-      // Pool di carte: EDHREC top inclusions
-      // Filtra per quelle conosciute, max 250
       const pool = (edhrecPool || []).slice(0, 250);
-
-      if (pool.length < 50) {
-        throw new Error('Pool EDHREC troppo piccolo per questo commander. Provo lo stesso ma il risultato potrebbe essere limitato.');
+      if (pool.length < 30) {
+        throw new Error('Pool EDHREC troppo piccolo per questo commander.');
       }
-
-      if (onProgress) onProgress({ phase: 'Claude sta selezionando le carte...', step: 2, total: 4 });
-
-      // Costruisci il prompt
-      const poolStr = pool.map((c, i) => `${i+1}. ${c.name}`).join('\n');
-      const existingStr = mode === 'optimize' && existingCards
-        ? existingCards.filter(c => !c.isCommander && !c.tags?.includes('land'))
-            .map(c => c.name).join(', ')
-        : '';
 
       const bracketRules = {
-        1: 'Bracket 1 - Exhibition: nessun Game Changer, no MLD, no extra turn, no combo infinite, mazzo casual e tematico.',
-        2: 'Bracket 2 - Core: livello precon. No Game Changer, no MLD, no extra turn chain, no combo infinite. Carte di rara potenza ammesse ma non fast mana.',
-        3: 'Bracket 3 - Upgraded: precon potenziato. Massimo 3 Game Changer ammessi, no MLD, no extra turn chain, no combo a 2 carte facili. Tutor moderati ammessi.',
-        4: 'Bracket 4 - Optimized: ottimizzato non-cEDH. Tutto ammesso senza limite specifico, ma il mazzo deve essere coerente.',
-        5: 'Bracket 5 - cEDH: tutto ammesso. Massima ottimizzazione competitiva.',
+        1: 'Bracket 1: nessun Game Changer, no MLD, no extra turn, no combo infinite. Casual e tematico.',
+        2: 'Bracket 2: livello precon. No Game Changer, no MLD, no extra turn chain, no combo infinite. No fast mana.',
+        3: 'Bracket 3: max 3 Game Changer, no MLD, no extra turn chain, no combo a 2 carte facili. Tutor moderati.',
+        4: 'Bracket 4: ottimizzato non-cEDH. Tutto ammesso ma il mazzo deve essere coerente.',
+        5: 'Bracket 5 cEDH: tutto ammesso, ottimizzazione massima.',
       };
 
-      const sys = `Sei un esperto di Magic: The Gathering Commander e costruisci mazzi ottimizzati al massimo per la strategia richiesta. Selezioni 99 carte dal pool fornito (EDHREC top inclusions per il commander), scegliendo non per popolarità ma per VERA SINERGIA con il commander e il piano di gioco. Includi anche sinergie meno conosciute se hanno senso. Rispetti i vincoli di bracket. Per ogni carta scelta motivi brevemente perché sta lì e con quali altre carte del mazzo lavora. Rispondi SOLO con JSON valido, niente markdown fences.`;
+      // === PASSAGGIO 1: selezione dei 99 nomi ===
+      if (onProgress) onProgress({ phase: 'Claude seleziona le 99 carte...', step: 2, total: 5 });
 
-      const usr = `COMANDANTE: ${commander.name}
-TESTO ORACLE: ${commander.oracle_text}
+      const poolStr = pool.map((c, i) => `${i+1}. ${c.name}`).join('\n');
+      const existingStr = mode === 'optimize' && existingCards
+        ? existingCards.filter(c => !c.isCommander).slice(0, 99).map(c => c.name).join(', ')
+        : '';
+
+      const sysSelect = `Sei un esperto costruttore di mazzi Magic Commander. Selezioni 99 carte ottimizzate per la strategia richiesta. Rispondi SOLO con JSON valido, niente markdown.`;
+
+      const usrSelect = `COMANDANTE: ${commander.name}
+TESTO: ${commander.oracle_text}
 COLOR IDENTITY: ${colorIdentity}
 
-CONTESTO ARCHETIPO/STRATEGIA:
+STRATEGIA:
 ${archetypeContext.full_context}
 
-BRACKET TARGET: ${bracketTarget}
-REGOLE BRACKET: ${bracketRules[bracketTarget]}
+BRACKET TARGET: ${bracketTarget} — ${bracketRules[bracketTarget]}
 
-POOL DI CARTE DISPONIBILI (top inclusions EDHREC per questo commander):
+POOL EDHREC (carte popolari per questo commander):
 ${poolStr}
 
-${mode === 'optimize' && existingStr ? `CARTE GIÀ NEL MAZZO ATTUALE (riferimento, puoi tenerne alcune):
-${existingStr}` : ''}
+${mode === 'optimize' && existingStr ? `MAZZO ATTUALE da ottimizzare (riferimento):\n${existingStr}\n` : ''}
 
-COMPITO: Costruisci una decklist da 99 carte (escluso il commander) che:
-- Esegue al meglio la strategia descritta
-- Rispetta il bracket ${bracketTarget}
-- Mescola scelte canoniche con sinergie meno ovvie ma valide
-- Include il giusto numero di terre (37 di default, adatta in base al ramp e curva), ramp, draw, removal coerenti con la strategia
-- Per ogni carta motivi in 8-15 parole italiano perché sta lì
-- Per ogni carta indichi 1-3 carte del mazzo con cui ha sinergia (referenced_synergies)
+COMPITO: Scegli ESATTAMENTE 99 carte (escluso commander) per costruire il mazzo.
+- Mescola scelte canoniche con qualche sinergia meno ovvia ma valida
+- Distribuzione tipica: ~37 lands, ~10 ramp, ~10 draw, ~10 interaction, resto threat/protezione/synergy
+- Rispetta il bracket
+- Le carte devono esistere e essere nella color identity ${colorIdentity}
+- Puoi scegliere carte fuori dal pool EDHREC se sai che sono ottime per la strategia
+- 2-3 frasi italiano sulla filosofia di costruzione
 
-OUTPUT JSON (esattamente questa struttura, esattamente 99 carte non commander):
+Rispondi con questo JSON ESATTO (solo nomi, niente motivazioni qui):
 {
-  "lands_count": 37,
-  "ramp_count": 10,
-  "draw_count": 10,
-  "interaction_count": 10,
-  "build_notes": "2-3 frasi italiano sulla filosofia di costruzione",
-  "cards": [
-    {"name": "Carta Esatta", "category": "land|ramp|draw|removal|threat|protection|win_con|engine|utility|tribal|combo_piece|tutor", "why": "8-15 parole italiano", "referenced_synergies": ["altra carta", "altra carta"]}
-  ]
+  "build_notes": "2-3 frasi italiano sulla filosofia",
+  "card_names": ["Nome 1", "Nome 2", ..., "Nome 99"]
 }`;
 
-      const text = await callClaude(apiKey, sys, usr, 8000);
+      const selectText = await callClaude(apiKey, sysSelect, usrSelect, 4000);
+      const selection = extractJsonFromResponse(selectText);
 
-      if (onProgress) onProgress({ phase: 'Verifico le carte su Scryfall...', step: 3, total: 4 });
-
-      const parsed = extractJsonFromResponse(text);
-      if (!parsed.cards || !Array.isArray(parsed.cards)) {
-        throw new Error('Formato risposta non valido da Claude');
+      if (!selection.card_names || !Array.isArray(selection.card_names)) {
+        throw new Error('Claude non ha restituito una lista valida di nomi');
+      }
+      if (selection.card_names.length < 50) {
+        throw new Error(`Claude ha restituito solo ${selection.card_names.length} carte, troppo poche.`);
       }
 
-      // Valida le carte su Scryfall (batch)
-      const cardNames = parsed.cards.map(c => c.name);
-      const { fetched, notFound } = await fetchCardsFromScryfall(cardNames);
+      // Limita a 99 se ne ha date di più, padding se poche
+      let names = selection.card_names.slice(0, 99);
 
-      // Marca le carte non trovate
-      const validatedCards = parsed.cards.map(c => {
-        const sc = fetched[c.name.toLowerCase()];
+      // === PASSAGGIO 2: validazione su Scryfall ===
+      if (onProgress) onProgress({ phase: 'Verifico le carte su Scryfall...', step: 3, total: 5 });
+
+      const { fetched, notFound } = await fetchCardsFromScryfall(names);
+
+      // === PASSAGGIO 3: motivazioni in batch da 20 ===
+      if (onProgress) onProgress({ phase: 'Claude scrive le motivazioni...', step: 4, total: 5 });
+
+      const motivations = {};
+      const BATCH_SIZE = 20;
+      const batches = [];
+      for (let i = 0; i < names.length; i += BATCH_SIZE) {
+        batches.push(names.slice(i, i + BATCH_SIZE));
+      }
+
+      const sysMot = `Sei un esperto di MTG Commander. Per ogni carta indichi: categoria funzionale, perché sta nel mazzo (motivazione concisa), e con quali altre carte del mazzo è in sinergia. Rispondi SOLO con JSON valido.`;
+
+      for (let bi = 0; bi < batches.length; bi++) {
+        if (onProgress) onProgress({
+          phase: `Claude scrive le motivazioni... (batch ${bi+1}/${batches.length})`,
+          step: 4,
+          total: 5
+        });
+        const batchNames = batches[bi];
+        const usrMot = `COMANDANTE: ${commander.name}
+STRATEGIA: ${archetypeContext.label}
+TUTTE LE 99 CARTE DEL MAZZO (per riferimento sinergie):
+${names.join(', ')}
+
+CARTE DA MOTIVARE IN QUESTO BATCH:
+${batchNames.map((n, i) => `${i+1}. ${n}`).join('\n')}
+
+Per ogni carta:
+- category (UNA): land | ramp | draw | removal | threat | protection | win_con | engine | utility | tribal | combo_piece | tutor
+- why: 8-15 parole italiano, perché sta nel mazzo
+- referenced_synergies: 1-3 nomi di carte ALTRE del mazzo con cui ha sinergia diretta (vuoto se sta lì come standalone)
+
+JSON:
+{"items": [{"name":"...","category":"...","why":"...","referenced_synergies":["..."]}]}`;
+
+        try {
+          const motText = await callClaude(apiKey, sysMot, usrMot, 2500);
+          const parsed = extractJsonFromResponse(motText);
+          if (Array.isArray(parsed.items)) {
+            parsed.items.forEach(item => {
+              if (item.name) motivations[item.name] = item;
+            });
+          }
+        } catch (e) {
+          console.warn(`Batch ${bi} motivazioni fallito:`, e);
+        }
+        await new Promise(r => setTimeout(r, 150));
+      }
+
+      // === PASSAGGIO 4: assembla risultato ===
+      if (onProgress) onProgress({ phase: 'Assemblo la lista finale...', step: 5, total: 5 });
+
+      const cards = names.map(name => {
+        const sc = fetched[name.toLowerCase()];
+        const mot = motivations[name] || {};
         return {
-          ...c,
+          name,
+          category: mot.category || guessCategoryFromCard(sc),
+          why: mot.why || '(motivazione non disponibile)',
+          referenced_synergies: mot.referenced_synergies || [],
           found: !!sc,
-          card_data: sc ? normalizeCard(sc, c.name, false) : null,
+          card_data: sc ? normalizeCard(sc, name, false) : null,
         };
       });
 
-      if (onProgress) onProgress({ phase: 'Lista pronta!', step: 4, total: 4 });
-
       return {
-        ...parsed,
-        cards: validatedCards,
+        build_notes: selection.build_notes || '',
+        cards,
         commander_name: commander.name,
         commander_data: commander,
         bracket_target: bracketTarget,
@@ -1408,6 +1506,22 @@ OUTPUT JSON (esattamente questa struttura, esattamente 99 carte non commander):
         not_found: notFound,
         generated_at: new Date().toISOString(),
       };
+    }
+
+    // Helper: indovina la categoria di una carta dai dati Scryfall (fallback)
+    function guessCategoryFromCard(scCard) {
+      if (!scCard) return 'utility';
+      const types = (scCard.type_line || '').toLowerCase();
+      const text = (scCard.oracle_text || '').toLowerCase();
+      if (types.includes('land')) return 'land';
+      if (/\{t\}.*add\s+\{/i.test(text) && (types.includes('artifact') || types.includes('creature'))) return 'ramp';
+      if (/search your library for.*land/i.test(text)) return 'ramp';
+      if (/draw .* card/i.test(text)) return 'draw';
+      if (/destroy target|exile target|counter target/i.test(text)) return 'removal';
+      if (types.includes('creature') && scCard.power && parseInt(scCard.power) >= 4) return 'threat';
+      if (/hexproof|indestructible|protection from/i.test(text)) return 'protection';
+      if (/search your library for/i.test(text)) return 'tutor';
+      return 'utility';
     }
 
     // ============================================================
