@@ -1347,43 +1347,296 @@ ${data.customStrategy}`,
     // FASE 5 — Generatore Lista Ottimizzata
     // ============================================================
 
-    // Genera una decklist ottimizzata partendo da zero o ottimizzando una esistente
-    // APPROCCIO IN 2 PASSAGGI per evitare JSON troppo lunghi:
-    // 1. Claude sceglie i 99 nomi (output piccolo, sicuro)
-    // 2. Claude scrive motivazioni in batch da 20 (output piccoli, gestibili)
+    // ============================================================
+    // GENERATORE OTTIMIZZATO (v2 con mana base deterministica)
+    // ============================================================
+
+    // Restituisce il profilo ARCHETYPES da usare nel generatore.
+    // - Modalità preset: usa direttamente data.archetype
+    // - Modalità auto: usa l'archetipo primario rilevato
+    // - Modalità custom: deduce un archetipo "vicino" dalla descrizione, fallback midrange
+    function resolveArchetypeProfile(data, archetypeContext) {
+      if (data.archetype && ARCHETYPES[data.archetype]) {
+        return { profile: ARCHETYPES[data.archetype], key: data.archetype };
+      }
+      if (data.autoDetected?.primary_archetype && ARCHETYPES[data.autoDetected.primary_archetype]) {
+        return { profile: ARCHETYPES[data.autoDetected.primary_archetype], key: data.autoDetected.primary_archetype };
+      }
+      // Modalità custom: cerca match per parole chiave nella descrizione
+      const text = `${archetypeContext.label} ${archetypeContext.description} ${archetypeContext.full_context}`.toLowerCase();
+      const keywordMap = [
+        ['cedh combo', 'cedh_combo'], ['cedh stax', 'cedh_stax'], ['cedh', 'cedh_midrange'],
+        ['voltron', 'voltron'], ['aristocrat', 'aristocrats'], ['reanimator', 'reanimator'],
+        ['control', 'control'], ['token', 'tokens'], ['tribal', 'tribal'],
+        ['spellslinger', 'spellslinger'], ['lands matter', 'lands_matter'], ['lands_matter', 'lands_matter'],
+        ['big mana', 'big_mana'], ['ramp', 'big_mana'], ['lifegain', 'midrange'],
+        ['stax', 'cedh_stax'], ['combo', 'cedh_combo'], ['aggro', 'midrange'],
+      ];
+      for (const [kw, key] of keywordMap) {
+        if (text.includes(kw) && ARCHETYPES[key]) {
+          return { profile: ARCHETYPES[key], key };
+        }
+      }
+      return { profile: ARCHETYPES.midrange, key: 'midrange' };
+    }
+
+    // Costruisce le linee guida testuali per il prompt, basate sul profilo archetipo
+    function buildArchetypeGuidelines(profile, archetypeKey, archetypeContext, targetNonLand) {
+      const exp = profile.expected;
+      const lines = [];
+      lines.push(`PROFILO QUANTITATIVO PER L'ARCHETIPO "${profile.label}":`);
+      lines.push(`- Ramp: ${exp.ramp.min}-${exp.ramp.max} (ideale ${exp.ramp.ideal})`);
+      lines.push(`- Card draw / advantage: ${exp.draw.min}-${exp.draw.max} (ideale ${exp.draw.ideal})`);
+      lines.push(`- Interaction (removal + counter + spazza-via): ${exp.interaction.min}-${exp.interaction.max} (ideale ${exp.interaction.ideal})`);
+      lines.push(`- Tutor: ${exp.tutors.min}-${exp.tutors.max} (ideale ${exp.tutors.ideal})`);
+      lines.push(`- CMC medio target: ${exp.curve_avg.ideal} (range ${exp.curve_avg.min}-${exp.curve_avg.max})`);
+
+      // Pesi per dimensione → priorità qualitativa
+      const w = profile.weights || {};
+      const priorities = [];
+      if ((w.protection || 0) >= 0.18) priorities.push('PROTEZIONE: priorità ALTA — il mazzo ha bisogno di forte protezione del commander/strategia (target 6-10 pezzi)');
+      else if ((w.protection || 0) >= 0.12) priorities.push('Protezione: priorità media (target 4-6 pezzi)');
+      else priorities.push('Protezione: priorità bassa (target 2-4 pezzi)');
+
+      if ((w.draw || 0) >= 0.17) priorities.push('CARD DRAW: priorità ALTA — il mazzo deve avere motori di vantaggio costanti');
+      if ((w.interaction || 0) >= 0.18) priorities.push('INTERACTION: priorità ALTA — risposta densa al gioco avversario');
+      if ((w.synergy || 0) >= 0.18) priorities.push('SINERGIA: priorità ALTA — densità tematica fondamentale, evita filler generico');
+      if ((w.ramp || 0) >= 0.16) priorities.push('RAMP: priorità ALTA — accelerazione necessaria, considera 2-mana ramp e rocks');
+
+      if (priorities.length > 0) {
+        lines.push('');
+        lines.push('PRIORITÀ QUALITATIVE:');
+        priorities.forEach(p => lines.push(`- ${p}`));
+      }
+
+      // Hint specifici per archetipo
+      const archetypeHints = {
+        voltron: ['FOCUS: equipment + aure + protezione del commander.', 'Il commander deve passare e fare commander damage.', 'Includi tutor di equipment se possibile.'],
+        cedh_combo: ['FOCUS: combo veloce a 2-3 carte + protezione + tutor + draw.', 'CMC molto basso, fast mana se bracket lo permette.'],
+        cedh_stax: ['FOCUS: pezzi di stax + draw asimmetrico + win-con tardiva.', 'Ogni carta deve danneggiare gli avversari più di te.'],
+        aristocrats: ['FOCUS: sacrifice outlet + token generator + death trigger.', 'Il loop sac/death deve essere ridondante.'],
+        reanimator: ['FOCUS: discard outlet + reanimation + grossi target nel cimitero.', 'Pacchetto self-mill o self-discard fondamentale.'],
+        control: ['FOCUS: counterspell + removal + draw + 1-2 win-con tardive.', 'Niente threat squilibrati, vinci tardi.'],
+        tokens: ['FOCUS: token generator + anthems + sacrifice o overrun finale.', 'Densità di anthems fondamentale.'],
+        tribal: ['FOCUS: lord stack + tribali payoff + tutor di tipo creatura.', 'Il tipo creatura deve essere ridondante.'],
+        spellslinger: ['FOCUS: instant/sorcery cheap + payoff per cast + recursion.', 'Curva molto bassa, draw alto.'],
+        lands_matter: ['FOCUS: terre extra giocate + payoff per land drop + recursion lands.', 'Più terre del normale.'],
+        big_mana: ['FOCUS: ramp aggressivo + grosse minacce + ramp produttivo.', 'Curva alta, threat impattanti dopo turno 4.'],
+        midrange: ['FOCUS: bilanciamento, le migliori carte dei colori coerenti col commander.'],
+      };
+      const hints = archetypeHints[archetypeKey] || archetypeHints.midrange;
+      if (hints) {
+        lines.push('');
+        lines.push('LINEA STRATEGICA:');
+        hints.forEach(h => lines.push(`- ${h}`));
+      }
+
+      // Adatta i numeri al targetNonLand effettivo
+      lines.push('');
+      lines.push(`Adatta questi numeri al fatto che hai ${targetNonLand} carte non-land disponibili. Non sono vincoli rigidi: deviare è ammesso se la strategia lo giustifica, ma avvicinati il più possibile ai range.`);
+
+      return lines.join('\n');
+    }
+
+    // Calcola il numero di terre target per archetipo+curva
+    function calculateTargetLandCount(archetypeContext, commander, ramp_count_estimate = 10, archProfile = null) {
+      let target = 37;
+
+      // Priorità 1: usa il profilo archetipo se disponibile
+      if (archProfile?.expected?.lands?.ideal) {
+        target = archProfile.expected.lands.ideal;
+      } else {
+        // Priorità 2: keyword matching come fallback
+        const label = (archetypeContext.label || '').toLowerCase();
+        const desc = (archetypeContext.description || '').toLowerCase();
+        const fullCtx = (archetypeContext.full_context || '').toLowerCase();
+        const text = `${label} ${desc} ${fullCtx}`;
+
+        if (text.includes('cedh')) target = 30;
+        else if (text.includes('combo') && text.includes('fast')) target = 32;
+        else if (text.includes('big mana') || text.includes('lands matter') || text.includes('ramp aggressivo')) target = 40;
+        else if (text.includes('voltron')) target = 37;
+        else if (text.includes('control')) target = 38;
+        else if (text.includes('aggro')) target = 35;
+        else if (text.includes('reanimator')) target = 36;
+        else if (text.includes('spellslinger')) target = 36;
+      }
+
+      // Aggiustamento ramp: ogni 2 ramp sopra/sotto 10 → -1/+1 lands
+      const rampDelta = Math.floor((ramp_count_estimate - 10) / 2);
+      target -= rampDelta;
+
+      // Clamp a un range sano (assoluto), ma rispettando il profilo archetipo se più stretto
+      let minClamp = 28;
+      let maxClamp = 43;
+      if (archProfile?.expected?.lands) {
+        minClamp = Math.max(minClamp, archProfile.expected.lands.min - 2);
+        maxClamp = Math.min(maxClamp, archProfile.expected.lands.max + 2);
+      }
+      return Math.max(minClamp, Math.min(maxClamp, target));
+    }
+
+    // Estrae le terre dal pool EDHREC + raccomanda terre base
+    function pickLandsFromPool(edhrecPool, scryfallFetched, targetCount, colorIdentity, existingLands) {
+      const lands = [];
+      // Carte già fetchate dal pool che sono lands
+      const poolLands = (edhrecPool || [])
+        .filter(c => {
+          const sc = scryfallFetched[c.name.toLowerCase()];
+          return sc && (sc.type_line || '').toLowerCase().includes('land');
+        });
+
+      // Priorità 1: lands dal mazzo esistente (mode optimize)
+      const existingNames = new Set();
+      if (existingLands) {
+        existingLands.forEach(c => {
+          if (lands.length >= targetCount) return;
+          if ((c.type_line || '').toLowerCase().includes('land')) {
+            lands.push({ name: c.name, source: 'existing' });
+            existingNames.add(c.name.toLowerCase());
+          }
+        });
+      }
+
+      // Priorità 2: lands dal pool EDHREC non già aggiunte
+      for (const pc of poolLands) {
+        if (lands.length >= targetCount) break;
+        if (!existingNames.has(pc.name.toLowerCase())) {
+          lands.push({ name: pc.name, source: 'edhrec' });
+        }
+      }
+
+      // Priorità 3: terre base se ancora ne servono
+      const basicByColor = { W: 'Plains', U: 'Island', B: 'Swamp', R: 'Mountain', G: 'Forest' };
+      const colors = colorIdentity.split('').filter(c => basicByColor[c]);
+      let basicIndex = 0;
+      while (lands.length < targetCount) {
+        if (colors.length === 0) {
+          lands.push({ name: 'Wastes', source: 'basic' });
+        } else {
+          const col = colors[basicIndex % colors.length];
+          lands.push({ name: basicByColor[col], source: 'basic' });
+          basicIndex++;
+        }
+      }
+
+      return lands;
+    }
+
+    // Genera una decklist ottimizzata
+    // APPROCCIO v2:
+    // 1. Calcola target lands deterministicamente (fuori da Claude)
+    // 2. Usa Sinergie/Cuts per costruire whitelist/blacklist (mode optimize)
+    // 3. Claude sceglie SOLO le 62 carte non-land
+    // 4. Validazione + check finale + motivazioni in batch
     async function generateOptimizedDeck({
       commander, archetypeContext, bracketTarget, edhrecPool,
       mode, // 'fromScratch' o 'optimize'
       existingCards, // solo per mode 'optimize'
+      synergiesData, // solo per mode 'optimize': risultato dalla tab Sinergie
+      cutsData, // solo per mode 'optimize': risultato dalla tab Cuts (lista carte da escludere)
+      data, // per risolvere il profilo archetipo
       apiKey,
       onProgress,
     }) {
       const colorIdentity = (commander.color_identity || []).join('') || 'C';
 
-      if (onProgress) onProgress({ phase: 'Preparo il pool di carte da EDHREC...', step: 1, total: 5 });
+      if (onProgress) onProgress({ phase: 'Calcolo la mana base ideale...', step: 1, total: 6 });
 
-      const pool = (edhrecPool || []).slice(0, 250);
-      if (pool.length < 30) {
-        throw new Error('Pool EDHREC troppo piccolo per questo commander.');
+      // Risolvi profilo archetipo SUBITO (usato per terre + linee guida)
+      const { profile: archProfile, key: archKey } = resolveArchetypeProfile(data || {}, archetypeContext);
+
+      // Stima ramp dal mazzo esistente o usa default
+      let rampEstimate = 10;
+      if (mode === 'optimize' && existingCards) {
+        const rampCount = existingCards.filter(c =>
+          c.tags?.some(t => t.startsWith('ramp_'))
+        ).length;
+        rampEstimate = rampCount;
       }
 
+      const targetLands = calculateTargetLandCount(archetypeContext, commander, rampEstimate, archProfile);
+      const targetNonLand = 99 - targetLands;
+
+      // Costruisci whitelist (sinergie alte) e blacklist (cuts) per mode optimize
+      const whitelistKeep = []; // carte sinergiche da preservare
+      const blacklistExclude = new Set(); // carte da NON includere
+      const whitelistDescription = [];
+
+      if (mode === 'optimize' && synergiesData?.scores) {
+        Object.entries(synergiesData.scores).forEach(([cardName, syn]) => {
+          // Tieni le carte enabler/amplifier/protector/tribal/combo_piece con score >= 7
+          if (['enabler', 'amplifier', 'protector', 'tribal'].includes(syn.category) && syn.score >= 7) {
+            whitelistKeep.push({ name: cardName, category: syn.category, score: syn.score });
+          }
+        });
+        whitelistKeep.sort((a, b) => b.score - a.score);
+      }
+
+      if (mode === 'optimize' && cutsData?.cuts) {
+        cutsData.cuts.forEach(cut => {
+          if (cut.card) blacklistExclude.add(cut.card);
+        });
+      }
+
+      // === PASSAGGIO 1: Pool dal Scryfall (per validare lands) ===
+      if (onProgress) onProgress({ phase: 'Recupero info delle carte del pool...', step: 2, total: 6 });
+
+      const poolNames = (edhrecPool || []).slice(0, 250).map(c => c.name);
+      const existingNonLandNames = mode === 'optimize' && existingCards
+        ? existingCards.filter(c => !c.isCommander).map(c => c.name)
+        : [];
+      const allFetchNames = [...new Set([...poolNames, ...existingNonLandNames])];
+
+      const poolFetch = await fetchCardsFromScryfall(allFetchNames);
+      const poolFetched = poolFetch.fetched;
+
+      // === PASSAGGIO 2: Selezione delle terre (deterministica) ===
+      if (onProgress) onProgress({ phase: `Seleziono ${targetLands} terre...`, step: 3, total: 6 });
+
+      const existingLands = mode === 'optimize' && existingCards
+        ? existingCards.filter(c => (c.type_line || '').toLowerCase().includes('land'))
+        : [];
+
+      const selectedLands = pickLandsFromPool(
+        edhrecPool || [],
+        poolFetched,
+        targetLands,
+        colorIdentity,
+        existingLands
+      );
+
+      // === PASSAGGIO 3: Claude sceglie le carte non-land ===
+      if (onProgress) onProgress({ phase: `Claude seleziona ${targetNonLand} carte non-land...`, step: 4, total: 6 });
+
+      const nonLandPool = (edhrecPool || []).filter(c => {
+        const sc = poolFetched[c.name.toLowerCase()];
+        return sc && !(sc.type_line || '').toLowerCase().includes('land');
+      });
+      const poolStr = nonLandPool.map((c, i) => `${i+1}. ${c.name}`).join('\n');
+
       const bracketRules = {
-        1: 'Bracket 1: nessun Game Changer, no MLD, no extra turn, no combo infinite. Casual e tematico.',
-        2: 'Bracket 2: livello precon. No Game Changer, no MLD, no extra turn chain, no combo infinite. No fast mana.',
-        3: 'Bracket 3: max 3 Game Changer, no MLD, no extra turn chain, no combo a 2 carte facili. Tutor moderati.',
-        4: 'Bracket 4: ottimizzato non-cEDH. Tutto ammesso ma il mazzo deve essere coerente.',
+        1: 'Bracket 1: niente Game Changer, no MLD, no extra turn, no combo. Casual.',
+        2: 'Bracket 2: livello precon. No Game Changer, no MLD, no extra turn chain, no combo, no fast mana.',
+        3: 'Bracket 3: max 3 Game Changer. No MLD, no extra turn chain, no combo a 2 carte facili. Tutor moderati.',
+        4: 'Bracket 4: ottimizzato non-cEDH, tutto ammesso ma coerente.',
         5: 'Bracket 5 cEDH: tutto ammesso, ottimizzazione massima.',
       };
 
-      // === PASSAGGIO 1: selezione dei 99 nomi ===
-      if (onProgress) onProgress({ phase: 'Claude seleziona le 99 carte...', step: 2, total: 5 });
-
-      const poolStr = pool.map((c, i) => `${i+1}. ${c.name}`).join('\n');
-      const existingStr = mode === 'optimize' && existingCards
-        ? existingCards.filter(c => !c.isCommander).slice(0, 99).map(c => c.name).join(', ')
+      const whitelistInstruction = whitelistKeep.length > 0
+        ? `\n\nDEVI INCLUDERE OBBLIGATORIAMENTE queste carte sinergiche già giudicate forti per il mazzo (${whitelistKeep.length}):
+${whitelistKeep.map(w => `- ${w.name} (${w.category}, sinergia ${w.score}/10)`).join('\n')}`
         : '';
 
-      const sysSelect = `Sei un esperto costruttore di mazzi Magic Commander. Selezioni 99 carte ottimizzate per la strategia richiesta. Rispondi SOLO con JSON valido, niente markdown.`;
+      const blacklistInstruction = blacklistExclude.size > 0
+        ? `\n\nNON INCLUDERE queste carte (giudicate inadatte al mazzo nella precedente analisi):
+${[...blacklistExclude].map(n => `- ${n}`).join('\n')}`
+        : '';
+
+      // Risolvi profilo archetipo per linee guida dinamiche (già risolto sopra)
+      const archetypeGuidelines = buildArchetypeGuidelines(archProfile, archKey, archetypeContext, targetNonLand);
+
+      const sysSelect = `Sei un esperto costruttore di mazzi MTG Commander. Selezioni carte non-land per costruire un mazzo ottimizzato per la strategia richiesta. Le terre sono già state scelte separatamente. Ragiona in base alla strategia, non applicare formule fisse: deviare dai range è ammesso quando la strategia lo giustifica. Rispondi SOLO con JSON valido, niente markdown.`;
 
       const usrSelect = `COMANDANTE: ${commander.name}
 TESTO: ${commander.oracle_text}
@@ -1394,23 +1647,31 @@ ${archetypeContext.full_context}
 
 BRACKET TARGET: ${bracketTarget} — ${bracketRules[bracketTarget]}
 
-POOL EDHREC (carte popolari per questo commander):
+NUMERO TERRE GIÀ FISSATO: ${targetLands} (le ho scelte separatamente, NON includerle nella tua risposta)
+DEVI SCEGLIERE ESATTAMENTE: ${targetNonLand} carte non-land
+
+POOL EDHREC (carte non-land popolari per questo commander):
 ${poolStr}
+${whitelistInstruction}
+${blacklistInstruction}
 
-${mode === 'optimize' && existingStr ? `MAZZO ATTUALE da ottimizzare (riferimento):\n${existingStr}\n` : ''}
+${archetypeGuidelines}
 
-COMPITO: Scegli ESATTAMENTE 99 carte (escluso commander) per costruire il mazzo.
-- Mescola scelte canoniche con qualche sinergia meno ovvia ma valida
-- Distribuzione tipica: ~37 lands, ~10 ramp, ~10 draw, ~10 interaction, resto threat/protezione/synergy
-- Rispetta il bracket
-- Le carte devono esistere e essere nella color identity ${colorIdentity}
-- Puoi scegliere carte fuori dal pool EDHREC se sai che sono ottime per la strategia
-- 2-3 frasi italiano sulla filosofia di costruzione
+COMPITO:
+1. Scegli ESATTAMENTE ${targetNonLand} carte non-land (verifica il conteggio prima di rispondere)
+2. Avvicinati ai range del profilo archetipo ma sentiti libero di deviare se la strategia specifica lo richiede
+3. Rispetta il bracket e le whitelist/blacklist sopra
+4. Le carte devono esistere e rispettare la color identity ${colorIdentity}
+5. Mescola scelte canoniche con sinergie meno ovvie ma valide per QUESTO commander
+6. Spiega in 4-6 frasi italiano la filosofia di costruzione, includendo:
+   - Quali pacchetti tematici hai costruito
+   - Come la lista esegue la strategia
+   - Eventuali deviazioni dai range standard e perché
 
-Rispondi con questo JSON ESATTO (solo nomi, niente motivazioni qui):
+Rispondi con JSON ESATTO:
 {
-  "build_notes": "2-3 frasi italiano sulla filosofia",
-  "card_names": ["Nome 1", "Nome 2", ..., "Nome 99"]
+  "build_notes": "filosofia di costruzione 4-6 frasi italiano",
+  "card_names": ["Nome 1", "Nome 2", ..., "Nome ${targetNonLand}"]
 }`;
 
       const selectText = await callClaude(apiKey, sysSelect, usrSelect, 4000);
@@ -1419,53 +1680,64 @@ Rispondi con questo JSON ESATTO (solo nomi, niente motivazioni qui):
       if (!selection.card_names || !Array.isArray(selection.card_names)) {
         throw new Error('Claude non ha restituito una lista valida di nomi');
       }
-      if (selection.card_names.length < 50) {
-        throw new Error(`Claude ha restituito solo ${selection.card_names.length} carte, troppo poche.`);
+
+      let nonLandNames = selection.card_names.slice(0, targetNonLand);
+
+      // Forza l'inclusione della whitelist se non ci sono già
+      if (mode === 'optimize' && whitelistKeep.length > 0) {
+        const namesSet = new Set(nonLandNames.map(n => n.toLowerCase()));
+        for (const w of whitelistKeep) {
+          if (!namesSet.has(w.name.toLowerCase()) && nonLandNames.length < targetNonLand) {
+            nonLandNames.push(w.name);
+            namesSet.add(w.name.toLowerCase());
+          }
+        }
       }
 
-      // Limita a 99 se ne ha date di più, padding se poche
-      let names = selection.card_names.slice(0, 99);
+      // === PASSAGGIO 4: Validazione su Scryfall ===
+      if (onProgress) onProgress({ phase: 'Verifico le carte non-land su Scryfall...', step: 5, total: 6 });
 
-      // === PASSAGGIO 2: validazione su Scryfall ===
-      if (onProgress) onProgress({ phase: 'Verifico le carte su Scryfall...', step: 3, total: 5 });
+      const { fetched: nonLandFetched, notFound: nonLandNotFound } = await fetchCardsFromScryfall(nonLandNames);
+      const landNames = selectedLands.map(l => l.name);
+      const { fetched: landFetched, notFound: landNotFound } = await fetchCardsFromScryfall(landNames);
+      const allFetched = { ...nonLandFetched, ...landFetched };
+      const allNotFound = [...nonLandNotFound, ...landNotFound];
 
-      const { fetched, notFound } = await fetchCardsFromScryfall(names);
+      // === PASSAGGIO 5: Motivazioni in batch ===
+      if (onProgress) onProgress({ phase: 'Claude scrive le motivazioni...', step: 6, total: 6 });
 
-      // === PASSAGGIO 3: motivazioni in batch da 20 ===
-      if (onProgress) onProgress({ phase: 'Claude scrive le motivazioni...', step: 4, total: 5 });
-
+      const allNames = [...nonLandNames, ...landNames];
       const motivations = {};
       const BATCH_SIZE = 20;
-      const batches = [];
-      for (let i = 0; i < names.length; i += BATCH_SIZE) {
-        batches.push(names.slice(i, i + BATCH_SIZE));
+      const nonLandBatches = [];
+      for (let i = 0; i < nonLandNames.length; i += BATCH_SIZE) {
+        nonLandBatches.push(nonLandNames.slice(i, i + BATCH_SIZE));
       }
 
-      const sysMot = `Sei un esperto di MTG Commander. Per ogni carta indichi: categoria funzionale, perché sta nel mazzo (motivazione concisa), e con quali altre carte del mazzo è in sinergia. Rispondi SOLO con JSON valido.`;
+      const sysMot = `Sei un esperto MTG Commander. Per ogni carta indichi categoria, motivazione, e sinergie con altre carte del mazzo. Rispondi SOLO con JSON valido.`;
 
-      for (let bi = 0; bi < batches.length; bi++) {
+      for (let bi = 0; bi < nonLandBatches.length; bi++) {
         if (onProgress) onProgress({
-          phase: `Claude scrive le motivazioni... (batch ${bi+1}/${batches.length})`,
-          step: 4,
-          total: 5
+          phase: `Motivazioni... batch ${bi+1}/${nonLandBatches.length}`,
+          step: 6,
+          total: 6,
         });
-        const batchNames = batches[bi];
+        const batchNames = nonLandBatches[bi];
         const usrMot = `COMANDANTE: ${commander.name}
 STRATEGIA: ${archetypeContext.label}
-TUTTE LE 99 CARTE DEL MAZZO (per riferimento sinergie):
-${names.join(', ')}
+TUTTE LE CARTE DEL MAZZO (per riferimento sinergie):
+${allNames.join(', ')}
 
 CARTE DA MOTIVARE IN QUESTO BATCH:
 ${batchNames.map((n, i) => `${i+1}. ${n}`).join('\n')}
 
 Per ogni carta:
-- category (UNA): land | ramp | draw | removal | threat | protection | win_con | engine | utility | tribal | combo_piece | tutor
+- category (UNA): ramp | draw | removal | threat | protection | win_con | engine | utility | tribal | combo_piece | tutor
 - why: 8-15 parole italiano, perché sta nel mazzo
-- referenced_synergies: 1-3 nomi di carte ALTRE del mazzo con cui ha sinergia diretta (vuoto se sta lì come standalone)
+- referenced_synergies: 1-3 nomi di carte ALTRE del mazzo con cui ha sinergia diretta
 
 JSON:
 {"items": [{"name":"...","category":"...","why":"...","referenced_synergies":["..."]}]}`;
-
         try {
           const motText = await callClaude(apiKey, sysMot, usrMot, 2500);
           const parsed = extractJsonFromResponse(motText);
@@ -1480,32 +1752,209 @@ JSON:
         await new Promise(r => setTimeout(r, 150));
       }
 
-      // === PASSAGGIO 4: assembla risultato ===
-      if (onProgress) onProgress({ phase: 'Assemblo la lista finale...', step: 5, total: 5 });
-
-      const cards = names.map(name => {
-        const sc = fetched[name.toLowerCase()];
+      // === PASSAGGIO 6: Assembla risultato + check finale ===
+      const cards = [];
+      // Non-land
+      nonLandNames.forEach(name => {
+        const sc = nonLandFetched[name.toLowerCase()];
         const mot = motivations[name] || {};
-        return {
+        cards.push({
           name,
           category: mot.category || guessCategoryFromCard(sc),
           why: mot.why || '(motivazione non disponibile)',
           referenced_synergies: mot.referenced_synergies || [],
           found: !!sc,
           card_data: sc ? normalizeCard(sc, name, false) : null,
-        };
+          source: mode === 'optimize' && existingNonLandNames.includes(name) ? 'kept_from_original' : 'added',
+        });
+      });
+      // Lands
+      selectedLands.forEach(l => {
+        const sc = landFetched[l.name.toLowerCase()];
+        cards.push({
+          name: l.name,
+          category: 'land',
+          why: l.source === 'basic' ? 'Terra base per la mana base'
+             : l.source === 'existing' ? 'Terra del mazzo originale, mantenuta'
+             : 'Terra utility/fixing dal pool EDHREC',
+          referenced_synergies: [],
+          found: !!sc,
+          card_data: sc ? normalizeCard(sc, l.name, false) : null,
+          source: l.source,
+        });
+      });
+
+      // Check finali per warning — confrontati con i range del profilo archetipo
+      const finalLands = cards.filter(c => c.category === 'land').length;
+      const finalRamp = cards.filter(c => c.category === 'ramp').length;
+      const finalDraw = cards.filter(c => c.category === 'draw').length;
+      const finalRemoval = cards.filter(c => c.category === 'removal').length;
+      const finalProtection = cards.filter(c => c.category === 'protection').length;
+      const finalTutors = cards.filter(c => c.category === 'tutor').length;
+      const finalInteraction = finalRemoval + cards.filter(c => {
+        // counter approssimato: cerco "counter target" nel testo della carta originaria
+        const txt = (c.card_data?.oracle_text || '').toLowerCase();
+        return /counter target/.test(txt);
+      }).length;
+
+      const expRange = archProfile.expected;
+      const warnings = [];
+
+      // Lands: range hard
+      if (finalLands < 28) warnings.push(`${finalLands} terre — sotto il minimo assoluto di 28. Il mazzo non potrà giocare il mana richiesto.`);
+      else if (finalLands < expRange.lands.min - 2) warnings.push(`${finalLands} terre — sotto il range previsto per ${archProfile.label} (${expRange.lands.min}-${expRange.lands.max}).`);
+      else if (finalLands > expRange.lands.max + 2) warnings.push(`${finalLands} terre — sopra il range previsto per ${archProfile.label} (${expRange.lands.min}-${expRange.lands.max}).`);
+
+      // Ramp
+      if (finalRamp < expRange.ramp.min - 2) warnings.push(`${finalRamp} ramp — sotto il range previsto per ${archProfile.label} (${expRange.ramp.min}-${expRange.ramp.max}, ideale ${expRange.ramp.ideal}).`);
+      else if (finalRamp > expRange.ramp.max + 2) warnings.push(`${finalRamp} ramp — eccesso rispetto al range per ${archProfile.label} (${expRange.ramp.min}-${expRange.ramp.max}). Valuta di sostituirne alcuni con threat o draw.`);
+
+      // Draw
+      if (finalDraw < expRange.draw.min - 2) warnings.push(`${finalDraw} card draw — sotto il range previsto per ${archProfile.label} (${expRange.draw.min}-${expRange.draw.max}, ideale ${expRange.draw.ideal}).`);
+
+      // Interaction (somma removal + counter)
+      if (finalInteraction < expRange.interaction.min - 2) warnings.push(`${finalInteraction} interaction (removal + counter) — sotto il range per ${archProfile.label} (${expRange.interaction.min}-${expRange.interaction.max}).`);
+
+      // Tutori
+      if (finalTutors > expRange.tutors.max + 2) warnings.push(`${finalTutors} tutor — sopra il tetto consigliato per ${archProfile.label} (max ${expRange.tutors.max}). Potrebbe spingere il bracket sopra il target.`);
+
+      // Protezione: warning specifico per archetipi protection-heavy
+      const wProt = archProfile.weights?.protection || 0;
+      if (wProt >= 0.18 && finalProtection < 5) {
+        warnings.push(`${archProfile.label} con solo ${finalProtection} carte di protezione — l'archetipo richiede protezione alta (target 6-10). Il commander è esposto al removal.`);
+      }
+      if (wProt >= 0.12 && wProt < 0.18 && finalProtection < 3) {
+        warnings.push(`Solo ${finalProtection} carte di protezione — questo archetipo richiede almeno 4-6.`);
+      }
+
+      // Total count
+      if (cards.length !== 99) warnings.push(`Lista ha ${cards.length} carte invece di 99.`);
+
+      // Generate construction logic explanation
+      const constructionLogic = buildConstructionLogic({
+        mode,
+        targetLands,
+        finalLands,
+        rampEstimate,
+        whitelistKeep,
+        blacklistExclude: [...blacklistExclude],
+        archetypeContext,
+        archetypeProfile: archProfile,
+        archetypeKey: archKey,
+        bracketTarget,
+        cardCount: cards.length,
+        finalRamp,
+        finalDraw,
+        finalRemoval,
+        finalInteraction,
+        finalProtection,
+        finalTutors,
+        keptFromOriginal: cards.filter(c => c.source === 'kept_from_original').length,
       });
 
       return {
         build_notes: selection.build_notes || '',
+        construction_logic: constructionLogic,
         cards,
         commander_name: commander.name,
         commander_data: commander,
         bracket_target: bracketTarget,
         archetype_context: archetypeContext,
-        not_found: notFound,
+        mode,
+        target_lands: targetLands,
+        warnings,
+        not_found: allNotFound,
+        whitelist_used: whitelistKeep.map(w => w.name),
+        blacklist_used: [...blacklistExclude],
         generated_at: new Date().toISOString(),
       };
+    }
+
+    // Costruisce la spiegazione dettagliata della logica di generazione
+    function buildConstructionLogic({
+      mode, targetLands, finalLands, rampEstimate, whitelistKeep, blacklistExclude,
+      archetypeContext, archetypeProfile, archetypeKey,
+      bracketTarget, cardCount, finalRamp, finalDraw, finalRemoval, finalInteraction,
+      finalProtection, finalTutors, keptFromOriginal,
+    }) {
+      const lines = [];
+
+      lines.push(`MODALITÀ: ${mode === 'fromScratch' ? 'Generazione da zero' : 'Ottimizzazione del mazzo esistente'}.`);
+      lines.push(`STRATEGIA APPLICATA: ${archetypeContext.label}.`);
+      if (archetypeContext.description) {
+        lines.push(`Descrizione: ${archetypeContext.description}`);
+      }
+      if (archetypeProfile && archetypeKey) {
+        lines.push(`PROFILO ARCHETIPO USATO PER I RANGE: ${archetypeProfile.label} (chiave: ${archetypeKey})`);
+      }
+      lines.push(`BRACKET TARGET: ${bracketTarget}.`);
+      lines.push('');
+      lines.push('— MANA BASE —');
+      lines.push(`Ho fissato ${targetLands} terre come obiettivo, calcolato in base ad archetipo${mode === 'optimize' ? ` e ramp count del mazzo originale (${rampEstimate} ramp rilevati)` : ''}.`);
+      lines.push(`Risultato: ${finalLands} terre nel mazzo finale.`);
+
+      if (mode === 'optimize') {
+        lines.push('');
+        lines.push('— COERENZA CON ANALISI PRECEDENTE —');
+        if (whitelistKeep.length > 0) {
+          lines.push(`HO INCLUSO OBBLIGATORIAMENTE le ${whitelistKeep.length} carte già giudicate forti nella tab Sinergie (categoria enabler/amplifier/protector/tribal con score ≥ 7):`);
+          whitelistKeep.slice(0, 15).forEach(w => {
+            lines.push(`  • ${w.name} — ${w.category}, sinergia ${w.score}/10`);
+          });
+          if (whitelistKeep.length > 15) {
+            lines.push(`  ...e altre ${whitelistKeep.length - 15} carte`);
+          }
+        } else {
+          lines.push('Nessuna whitelist applicata (o non hai eseguito la tab Sinergie).');
+        }
+
+        if (blacklistExclude.length > 0) {
+          lines.push('');
+          lines.push(`HO ESCLUSO le ${blacklistExclude.length} carte già marcate come cut nella tab Cuts & Adds:`);
+          blacklistExclude.forEach(n => {
+            lines.push(`  • ${n}`);
+          });
+        } else {
+          lines.push('Nessuna blacklist applicata (o non hai eseguito la tab Cuts & Adds).');
+        }
+
+        if (keptFromOriginal > 0) {
+          lines.push('');
+          lines.push(`Ho mantenuto ${keptFromOriginal} carte non-land del mazzo originale.`);
+        }
+      }
+
+      // Confronto target vs reale per dimensione
+      if (archetypeProfile?.expected) {
+        const exp = archetypeProfile.expected;
+        const fmtRange = (label, real, range) => {
+          const inRange = real >= range.min && real <= range.max;
+          const marker = inRange ? '✓' : (real < range.min ? '↓ sotto' : '↑ sopra');
+          return `${label}: ${real} (target ${range.min}-${range.max}, ideale ${range.ideal}) ${marker}`;
+        };
+        lines.push('');
+        lines.push('— DISTRIBUZIONE vs PROFILO ARCHETIPO —');
+        lines.push(fmtRange('Lands', finalLands, exp.lands));
+        lines.push(fmtRange('Ramp', finalRamp, exp.ramp));
+        lines.push(fmtRange('Card draw', finalDraw, exp.draw));
+        lines.push(fmtRange('Interaction (removal+counter)', finalInteraction !== undefined ? finalInteraction : finalRemoval, exp.interaction));
+        lines.push(fmtRange('Tutor', finalTutors !== undefined ? finalTutors : 0, exp.tutors));
+        if (finalProtection !== undefined) {
+          const wProt = archetypeProfile.weights?.protection || 0;
+          const protTarget = wProt >= 0.18 ? '6-10' : wProt >= 0.12 ? '4-6' : '2-4';
+          lines.push(`Protezione: ${finalProtection} (target archetipo ${protTarget})`);
+        }
+      } else {
+        lines.push('');
+        lines.push('— DISTRIBUZIONE FINALE —');
+        lines.push(`Carte totali (escluso commander): ${cardCount} (target 99)`);
+        lines.push(`Terre: ${finalLands} | Ramp: ${finalRamp} | Card draw: ${finalDraw} | Removal: ${finalRemoval}`);
+      }
+
+      lines.push('');
+      lines.push(`Carte totali (escluso commander): ${cardCount} (target 99)`);
+
+      return lines.join('\n');
     }
 
     // Helper: indovina la categoria di una carta dai dati Scryfall (fallback)
@@ -1558,6 +2007,15 @@ JSON:
                 <span className={`${cls} text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase`}>
                   {card.category}
                 </span>
+                {card.source === 'kept_from_original' && (
+                  <span className="text-[10px] bg-blue-900/40 text-blue-300 border border-blue-700/30 px-1.5 py-0.5 rounded uppercase">tenuta</span>
+                )}
+                {card.source === 'added' && (
+                  <span className="text-[10px] bg-emerald-900/40 text-emerald-300 border border-emerald-700/30 px-1.5 py-0.5 rounded uppercase">nuova</span>
+                )}
+                {card.source === 'basic' && (
+                  <span className="text-[10px] bg-zinc-800 text-zinc-400 border border-zinc-700 px-1.5 py-0.5 rounded uppercase">base</span>
+                )}
                 {!found && <span className="text-[10px] text-red-400">non trovata su Scryfall</span>}
               </div>
               <p className="text-xs text-zinc-400 mt-1">{card.why}</p>
@@ -1575,7 +2033,7 @@ JSON:
       );
     }
 
-    function GenerateTab({ analysis, data, apiKey, onApiKeyMissing, generated, setGenerated }) {
+    function GenerateTab({ analysis, data, apiKey, onApiKeyMissing, generated, setGenerated, synergies, recommendations }) {
       const [running, setRunning] = useState(false);
       const [progress, setProgress] = useState({ phase: '', step: 0, total: 0 });
       const [error, setError] = useState('');
@@ -1589,10 +2047,17 @@ JSON:
         return `gen_${data.commander?.name}_${archCtx.mode}_${archCtx.label}_${archCtx.description?.slice(0,40) || ''}_b${data.bracketTarget}_${genMode}`;
       }, [data, genMode]);
 
+      // Per modalità optimize, sinergie e cuts sono OBBLIGATORI per garantire coerenza
+      const optimizeReady = genMode !== 'optimize' || (synergies && recommendations);
+
       const handleRun = async () => {
         if (!apiKey) { onApiKeyMissing(); return; }
         if (!data.commander) {
           setError('Manca il commander.');
+          return;
+        }
+        if (genMode === 'optimize' && (!synergies || !recommendations)) {
+          setError('Per ottimizzare il mazzo devi prima eseguire le tab "Sinergie" e "Cuts & Adds".');
           return;
         }
         setRunning(true);
@@ -1600,7 +2065,7 @@ JSON:
         try {
           const archetypeContext = getEffectiveArchetypeContext(data);
 
-          setProgress({ phase: 'Recupero il pool da EDHREC...', step: 0, total: 4 });
+          setProgress({ phase: 'Recupero il pool da EDHREC...', step: 0, total: 6 });
           const edhrecPool = await fetchEdhrecTopCards(data.commander.name);
 
           const result = await generateOptimizedDeck({
@@ -1610,6 +2075,9 @@ JSON:
             edhrecPool,
             mode: genMode,
             existingCards: genMode === 'optimize' ? analysis.all_cards : null,
+            synergiesData: genMode === 'optimize' ? synergies : null,
+            cutsData: genMode === 'optimize' ? recommendations : null,
+            data,
             apiKey,
             onProgress: setProgress,
           });
@@ -1705,18 +2173,44 @@ JSON:
               <p className="text-xs text-zinc-500 mb-4">
                 {genMode === 'fromScratch'
                   ? 'Costruisce 99 carte partendo solo da commander + strategia + bracket. Ignora il mazzo attuale.'
-                  : 'Parte dal mazzo attuale e lo riscrive tenendo le carte chiave, sostituendo le deboli e ottimizzando per la strategia.'}
+                  : 'Parte dal mazzo attuale e lo riscrive tenendo le carte sinergiche (whitelist da Sinergie) ed escludendo quelle giudicate deboli (blacklist da Cuts & Adds).'}
               </p>
 
+              {genMode === 'optimize' && !optimizeReady && (
+                <div className="mb-4 bg-amber-950/40 border border-amber-700/40 rounded-lg p-3">
+                  <div className="text-sm font-semibold text-amber-300 mb-1">⚠ Prerequisiti mancanti</div>
+                  <p className="text-xs text-amber-200 mb-2">
+                    Per garantire coerenza tra le tab, la modalità "Ottimizza" richiede di aver completato prima:
+                  </p>
+                  <ul className="text-xs text-amber-200 space-y-1 list-disc list-inside">
+                    <li>Tab <strong>Sinergie</strong> {synergies ? '✓ completata' : '— non eseguita'}</li>
+                    <li>Tab <strong>Cuts & Adds</strong> {recommendations ? '✓ completata' : '— non eseguita'}</li>
+                  </ul>
+                  <p className="text-xs text-amber-300/80 mt-2">
+                    Senza questi dati, il generatore potrebbe inserire carte che la tab Cuts & Adds ti aveva consigliato di togliere.
+                  </p>
+                </div>
+              )}
+
+              {genMode === 'optimize' && optimizeReady && (
+                <div className="mb-4 bg-emerald-950/40 border border-emerald-700/40 rounded-lg p-3">
+                  <div className="text-xs text-emerald-300">
+                    ✓ Userò {Object.values(synergies.scores).filter(s => ['enabler','amplifier','protector','tribal'].includes(s.category) && s.score >= 7).length} carte forti come whitelist
+                    e {recommendations.cuts?.length || 0} carte da escludere come blacklist
+                  </div>
+                </div>
+              )}
+
               <p className="text-xs text-zinc-500 mb-4">
-                Tempo: 60-90 secondi · Costo stimato: 50-80 centesimi · Risultato salvato in cache
+                Tempo: 60-120 secondi · Costo stimato: 60-90 centesimi · Risultato salvato in cache
               </p>
 
               <button
                 onClick={handleRun}
-                className="w-full bg-amber-500 hover:bg-amber-400 text-black font-semibold py-2.5 rounded-lg"
+                disabled={!optimizeReady}
+                className="w-full bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-black font-semibold py-2.5 rounded-lg"
               >
-                Genera lista
+                {genMode === 'optimize' && !optimizeReady ? 'Completa prima le tab Sinergie e Cuts & Adds' : 'Genera lista'}
               </button>
               {error && <div className="mt-3 text-sm text-red-400">{error}</div>}
             </div>
@@ -1782,6 +2276,30 @@ JSON:
               </p>
             )}
           </div>
+
+          {/* Warnings */}
+          {generated.warnings && generated.warnings.length > 0 && (
+            <div className="bg-amber-950/30 border border-amber-700/40 rounded-xl p-5">
+              <h4 className="text-sm font-semibold text-amber-300 mb-2">⚠ Avvisi sulla lista generata</h4>
+              <ul className="space-y-1">
+                {generated.warnings.map((w, i) => (
+                  <li key={i} className="text-sm text-amber-200">• {w}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Logica di costruzione completa */}
+          {generated.construction_logic && (
+            <details className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+              <summary className="cursor-pointer text-sm font-semibold text-zinc-300 hover:text-amber-400">
+                📋 Logica di costruzione completa (clicca per espandere)
+              </summary>
+              <pre className="text-xs text-zinc-300 mt-3 whitespace-pre-wrap font-mono leading-relaxed bg-zinc-950 border border-zinc-800 rounded p-3 max-h-96 overflow-y-auto scrollbar-thin">
+{generated.construction_logic}
+              </pre>
+            </details>
+          )}
 
           {/* Distribuzione */}
           <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
@@ -3387,6 +3905,8 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
               onApiKeyMissing={onApiKeyMissing}
               generated={generated}
               setGenerated={setGenerated}
+              synergies={synergies}
+              recommendations={recommendations}
             />
           )}
         </div>
@@ -3733,7 +4253,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.5 · Synergy + Bracket + Recommendations + Generator · 3 modalità archetipo · Scryfall + Claude + Spellbook + EDHREC
+            v0.7 · Generator archetype-aware · Range dinamici per archetipo · Scryfall + Claude + Spellbook + EDHREC
           </footer>
         </div>
       );
