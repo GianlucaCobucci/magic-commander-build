@@ -305,8 +305,9 @@ Estrai il profilo del comandante in questo JSON (in italiano, descrizioni concis
       return extractJsonFromResponse(text);
     }
 
-    async function scoreSynergiesBatch(cards, commander, profile, archetype, apiKey, onProgress) {
-      const archetypeLabel = ARCHETYPES[archetype]?.label || archetype;
+    async function scoreSynergiesBatch(cards, commander, profile, archetype, apiKey, onProgress, archetypeContext) {
+      const archetypeLabel = archetypeContext?.label || ARCHETYPES[archetype]?.label || archetype;
+      const archetypeFullContext = archetypeContext?.full_context || `Archetipo: ${archetypeLabel}`;
       const BATCH_SIZE = 17;
       const BASIC_LANDS = ['plains','island','swamp','mountain','forest','wastes',
         'snow-covered plains','snow-covered island','snow-covered swamp',
@@ -320,7 +321,7 @@ Estrai il profilo del comandante in questo JSON (in italiano, descrizioni concis
         batches.push(toEvaluate.slice(i, i + BATCH_SIZE));
       }
 
-      const sys = `Sei un esperto di Magic: The Gathering Commander. Valuti la sinergia di carte rispetto a un comandante specifico. Sii rigoroso: l'utility generico (Sol Ring, Counterspell base, Swords to Plowshares) NON è sinergia, è goodstuff e va categorizzato come utility_generic. La sinergia vera è specifica al comandante e all'archetipo dichiarato. Rispondi SOLO con JSON valido, senza markdown fences né testo extra.`;
+      const sys = `Sei un esperto di Magic: The Gathering Commander. Valuti la sinergia di carte rispetto a un comandante specifico. Sii rigoroso: l'utility generico (Sol Ring, Counterspell base, Swords to Plowshares) NON è sinergia, è goodstuff e va categorizzato come utility_generic. La sinergia vera è specifica al comandante e alla strategia dichiarata. Rispondi SOLO con JSON valido, senza markdown fences né testo extra.`;
 
       for (let bi = 0; bi < batches.length; bi++) {
         if (onProgress) onProgress(bi, batches.length);
@@ -331,9 +332,10 @@ Estrai il profilo del comandante in questo JSON (in italiano, descrizioni concis
 
         const usr = `COMANDANTE: ${commander.name}
 PROFILO COMMANDER: ${JSON.stringify(profile)}
-ARCHETIPO DICHIARATO: ${archetypeLabel}
+STRATEGIA / CONTESTO ARCHETIPO:
+${archetypeFullContext}
 
-Per ogni carta, valuta sinergia con questo comandante in questo archetipo (0-10):
+Per ogni carta, valuta sinergia con questo comandante in questa strategia (0-10):
 - 10 = pezzo chiave imprescindibile per la strategia
 - 8-9 = amplificatore forte e specifico
 - 6-7 = utile in tema ma non specifico per QUESTO commander
@@ -623,7 +625,10 @@ ${cardList}`;
       const [progress, setProgress] = useState({ current: 0, total: 0, phase: '' });
       const [error, setError] = useState('');
 
-      const cacheKey = `synergies_${data.commander?.name}_${data.archetype}`;
+      const cacheKey = useMemo(() => {
+        const archCtx = getEffectiveArchetypeContext(data);
+        return `synergies_${data.commander?.name}_${archCtx.mode}_${archCtx.label}_${(archCtx.description || '').slice(0,40)}_b${data.bracketTarget}`;
+      }, [data]);
 
       const handleRun = async () => {
         if (!apiKey) { onApiKeyMissing(); return; }
@@ -634,13 +639,15 @@ ${cardList}`;
           const profile = await extractCommanderProfile(data.commander, apiKey);
 
           setProgress({ current: 0, total: 1, phase: 'Analizzo le sinergie carta per carta...' });
+          const archetypeContext = getEffectiveArchetypeContext(data);
           const scores = await scoreSynergiesBatch(
             analysis.all_cards,
             data.commander,
             profile,
             data.archetype,
             apiKey,
-            (curr, total) => setProgress({ current: curr, total, phase: 'Analizzo le sinergie carta per carta...' })
+            (curr, total) => setProgress({ current: curr, total, phase: 'Analizzo le sinergie carta per carta...' }),
+            archetypeContext
           );
 
           const result = { profile, scores };
@@ -1210,6 +1217,535 @@ ${cardList}`;
     }
 
     // ============================================================
+    // HELPER — Modalità Auto-rileva e Custom (per archetipo)
+    // ============================================================
+
+    // Auto-rileva archetipo leggendo decklist + commander
+    async function autoDetectArchetype(commander, cards, apiKey) {
+      const sys = `Sei un esperto di Magic: The Gathering Commander. Analizza un mazzo e identifica archetipo principale, eventuali sotto-temi, e piano di gioco. Rispondi SOLO con JSON valido, no markdown fences.`;
+
+      const cardSummary = cards
+        .filter(c => !c.isCommander)
+        .slice(0, 99)
+        .map(c => `${c.name} (${c.type_line.replace(/—.*/, '').trim()}, CMC ${c.cmc})`)
+        .join(', ');
+
+      const usr = `COMANDANTE: ${commander.name}
+TESTO: ${commander.oracle_text}
+COLOR IDENTITY: ${(commander.color_identity || []).join('') || 'C'}
+
+CARTE NEL MAZZO (99):
+${cardSummary}
+
+Identifica:
+1. Archetipo principale (uno tra: cedh_combo, cedh_stax, cedh_midrange, voltron, aristocrats, aggro, control, combo, midrange, reanimator, tokens, tribal, spellslinger, lands_matter, group_hug, lifegain, stax, big_mana)
+2. Sotto-temi se presenti
+3. Piano di gioco descritto come fosse il proprietario del mazzo (3-4 frasi italiano)
+
+JSON:
+{
+  "primary_archetype": "...",
+  "secondary_themes": ["..."],
+  "strategy_description": "descrizione in italiano del piano di gioco completo",
+  "win_conditions": ["come vince il mazzo"]
+}`;
+
+      const text = await callClaude(apiKey, sys, usr, 1200);
+      return extractJsonFromResponse(text);
+    }
+
+    // Restituisce la "descrizione effettiva" dell'archetipo da usare nei prompt
+    // Combina il preset con eventuale auto-detect o descrizione custom
+    function getEffectiveArchetypeContext(data) {
+      const archetypeMode = data.archetypeMode || 'preset';
+      if (archetypeMode === 'preset') {
+        return {
+          mode: 'preset',
+          label: ARCHETYPES[data.archetype]?.label || data.archetype,
+          description: ARCHETYPES[data.archetype]?.description || '',
+          full_context: `Archetipo: ${ARCHETYPES[data.archetype]?.label}. ${ARCHETYPES[data.archetype]?.description}`,
+        };
+      }
+      if (archetypeMode === 'auto' && data.autoDetected) {
+        return {
+          mode: 'auto',
+          label: ARCHETYPES[data.autoDetected.primary_archetype]?.label || data.autoDetected.primary_archetype,
+          description: data.autoDetected.strategy_description || '',
+          full_context: `Archetipo principale: ${ARCHETYPES[data.autoDetected.primary_archetype]?.label || data.autoDetected.primary_archetype}.
+Sotto-temi: ${(data.autoDetected.secondary_themes || []).join(', ')}.
+Piano: ${data.autoDetected.strategy_description}.
+Win conditions: ${(data.autoDetected.win_conditions || []).join('; ')}.`,
+        };
+      }
+      if (archetypeMode === 'custom') {
+        return {
+          mode: 'custom',
+          label: 'Strategia personalizzata',
+          description: data.customStrategy || '',
+          full_context: `Strategia personalizzata definita dall'utente:
+${data.customStrategy}`,
+        };
+      }
+      return {
+        mode: 'preset',
+        label: 'Midrange',
+        description: '',
+        full_context: 'Archetipo: Midrange.',
+      };
+    }
+
+    // ============================================================
+    // FASE 5 — Generatore Lista Ottimizzata
+    // ============================================================
+
+    // Genera una decklist ottimizzata partendo da zero o ottimizzando una esistente
+    async function generateOptimizedDeck({
+      commander, archetypeContext, bracketTarget, edhrecPool,
+      mode, // 'fromScratch' o 'optimize'
+      existingCards, // solo per mode 'optimize'
+      apiKey,
+      onProgress,
+    }) {
+      const colorIdentity = (commander.color_identity || []).join('') || 'C';
+
+      if (onProgress) onProgress({ phase: 'Preparo il pool di carte da EDHREC...', step: 1, total: 4 });
+
+      // Pool di carte: EDHREC top inclusions
+      // Filtra per quelle conosciute, max 250
+      const pool = (edhrecPool || []).slice(0, 250);
+
+      if (pool.length < 50) {
+        throw new Error('Pool EDHREC troppo piccolo per questo commander. Provo lo stesso ma il risultato potrebbe essere limitato.');
+      }
+
+      if (onProgress) onProgress({ phase: 'Claude sta selezionando le carte...', step: 2, total: 4 });
+
+      // Costruisci il prompt
+      const poolStr = pool.map((c, i) => `${i+1}. ${c.name}`).join('\n');
+      const existingStr = mode === 'optimize' && existingCards
+        ? existingCards.filter(c => !c.isCommander && !c.tags?.includes('land'))
+            .map(c => c.name).join(', ')
+        : '';
+
+      const bracketRules = {
+        1: 'Bracket 1 - Exhibition: nessun Game Changer, no MLD, no extra turn, no combo infinite, mazzo casual e tematico.',
+        2: 'Bracket 2 - Core: livello precon. No Game Changer, no MLD, no extra turn chain, no combo infinite. Carte di rara potenza ammesse ma non fast mana.',
+        3: 'Bracket 3 - Upgraded: precon potenziato. Massimo 3 Game Changer ammessi, no MLD, no extra turn chain, no combo a 2 carte facili. Tutor moderati ammessi.',
+        4: 'Bracket 4 - Optimized: ottimizzato non-cEDH. Tutto ammesso senza limite specifico, ma il mazzo deve essere coerente.',
+        5: 'Bracket 5 - cEDH: tutto ammesso. Massima ottimizzazione competitiva.',
+      };
+
+      const sys = `Sei un esperto di Magic: The Gathering Commander e costruisci mazzi ottimizzati al massimo per la strategia richiesta. Selezioni 99 carte dal pool fornito (EDHREC top inclusions per il commander), scegliendo non per popolarità ma per VERA SINERGIA con il commander e il piano di gioco. Includi anche sinergie meno conosciute se hanno senso. Rispetti i vincoli di bracket. Per ogni carta scelta motivi brevemente perché sta lì e con quali altre carte del mazzo lavora. Rispondi SOLO con JSON valido, niente markdown fences.`;
+
+      const usr = `COMANDANTE: ${commander.name}
+TESTO ORACLE: ${commander.oracle_text}
+COLOR IDENTITY: ${colorIdentity}
+
+CONTESTO ARCHETIPO/STRATEGIA:
+${archetypeContext.full_context}
+
+BRACKET TARGET: ${bracketTarget}
+REGOLE BRACKET: ${bracketRules[bracketTarget]}
+
+POOL DI CARTE DISPONIBILI (top inclusions EDHREC per questo commander):
+${poolStr}
+
+${mode === 'optimize' && existingStr ? `CARTE GIÀ NEL MAZZO ATTUALE (riferimento, puoi tenerne alcune):
+${existingStr}` : ''}
+
+COMPITO: Costruisci una decklist da 99 carte (escluso il commander) che:
+- Esegue al meglio la strategia descritta
+- Rispetta il bracket ${bracketTarget}
+- Mescola scelte canoniche con sinergie meno ovvie ma valide
+- Include il giusto numero di terre (37 di default, adatta in base al ramp e curva), ramp, draw, removal coerenti con la strategia
+- Per ogni carta motivi in 8-15 parole italiano perché sta lì
+- Per ogni carta indichi 1-3 carte del mazzo con cui ha sinergia (referenced_synergies)
+
+OUTPUT JSON (esattamente questa struttura, esattamente 99 carte non commander):
+{
+  "lands_count": 37,
+  "ramp_count": 10,
+  "draw_count": 10,
+  "interaction_count": 10,
+  "build_notes": "2-3 frasi italiano sulla filosofia di costruzione",
+  "cards": [
+    {"name": "Carta Esatta", "category": "land|ramp|draw|removal|threat|protection|win_con|engine|utility|tribal|combo_piece|tutor", "why": "8-15 parole italiano", "referenced_synergies": ["altra carta", "altra carta"]}
+  ]
+}`;
+
+      const text = await callClaude(apiKey, sys, usr, 8000);
+
+      if (onProgress) onProgress({ phase: 'Verifico le carte su Scryfall...', step: 3, total: 4 });
+
+      const parsed = extractJsonFromResponse(text);
+      if (!parsed.cards || !Array.isArray(parsed.cards)) {
+        throw new Error('Formato risposta non valido da Claude');
+      }
+
+      // Valida le carte su Scryfall (batch)
+      const cardNames = parsed.cards.map(c => c.name);
+      const { fetched, notFound } = await fetchCardsFromScryfall(cardNames);
+
+      // Marca le carte non trovate
+      const validatedCards = parsed.cards.map(c => {
+        const sc = fetched[c.name.toLowerCase()];
+        return {
+          ...c,
+          found: !!sc,
+          card_data: sc ? normalizeCard(sc, c.name, false) : null,
+        };
+      });
+
+      if (onProgress) onProgress({ phase: 'Lista pronta!', step: 4, total: 4 });
+
+      return {
+        ...parsed,
+        cards: validatedCards,
+        commander_name: commander.name,
+        commander_data: commander,
+        bracket_target: bracketTarget,
+        archetype_context: archetypeContext,
+        not_found: notFound,
+        generated_at: new Date().toISOString(),
+      };
+    }
+
+    // ============================================================
+    // COMPONENTI FASE 5 — Tab Generatore
+    // ============================================================
+
+    function GenerateCardRow({ card, others }) {
+      const found = card.found !== false;
+      const scryfallUrl = `https://scryfall.com/search?q=!"${encodeURIComponent(card.name)}"`;
+      const catColors = {
+        land:         'bg-emerald-900/30 text-emerald-300',
+        ramp:         'bg-green-900/30 text-green-300',
+        draw:         'bg-blue-900/30 text-blue-300',
+        removal:      'bg-red-900/30 text-red-300',
+        threat:       'bg-orange-900/30 text-orange-300',
+        protection:   'bg-cyan-900/30 text-cyan-300',
+        win_con:      'bg-amber-900/30 text-amber-300',
+        engine:       'bg-purple-900/30 text-purple-300',
+        utility:      'bg-zinc-800 text-zinc-300',
+        tribal:       'bg-pink-900/30 text-pink-300',
+        combo_piece:  'bg-fuchsia-900/30 text-fuchsia-300',
+        tutor:        'bg-indigo-900/30 text-indigo-300',
+      };
+      const cls = catColors[card.category] || catColors.utility;
+
+      return (
+        <div className={`bg-zinc-950 border ${found ? 'border-zinc-800' : 'border-red-900/50'} rounded-lg p-3`}>
+          <div className="flex items-start gap-2">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h5 className="text-sm font-medium">
+                  <a href={scryfallUrl} target="_blank" rel="noreferrer" className="hover:text-amber-400">{card.name}</a>
+                </h5>
+                <span className={`${cls} text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase`}>
+                  {card.category}
+                </span>
+                {!found && <span className="text-[10px] text-red-400">non trovata su Scryfall</span>}
+              </div>
+              <p className="text-xs text-zinc-400 mt-1">{card.why}</p>
+              {card.referenced_synergies && card.referenced_synergies.length > 0 && (
+                <div className="mt-1.5 flex flex-wrap gap-1">
+                  <span className="text-[10px] text-zinc-500">sinergie:</span>
+                  {card.referenced_synergies.map((s, i) => (
+                    <span key={i} className="text-[10px] bg-zinc-900 border border-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded">{s}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function GenerateTab({ analysis, data, apiKey, onApiKeyMissing, generated, setGenerated }) {
+      const [running, setRunning] = useState(false);
+      const [progress, setProgress] = useState({ phase: '', step: 0, total: 0 });
+      const [error, setError] = useState('');
+      const [genMode, setGenMode] = useState('fromScratch'); // fromScratch | optimize
+      const [view, setView] = useState('cards'); // cards | text
+      const [filter, setFilter] = useState('all');
+      const [copied, setCopied] = useState(false);
+
+      const cacheKey = useMemo(() => {
+        const archCtx = getEffectiveArchetypeContext(data);
+        return `gen_${data.commander?.name}_${archCtx.mode}_${archCtx.label}_${archCtx.description?.slice(0,40) || ''}_b${data.bracketTarget}_${genMode}`;
+      }, [data, genMode]);
+
+      const handleRun = async () => {
+        if (!apiKey) { onApiKeyMissing(); return; }
+        if (!data.commander) {
+          setError('Manca il commander.');
+          return;
+        }
+        setRunning(true);
+        setError('');
+        try {
+          const archetypeContext = getEffectiveArchetypeContext(data);
+
+          setProgress({ phase: 'Recupero il pool da EDHREC...', step: 0, total: 4 });
+          const edhrecPool = await fetchEdhrecTopCards(data.commander.name);
+
+          const result = await generateOptimizedDeck({
+            commander: data.commander,
+            archetypeContext,
+            bracketTarget: data.bracketTarget,
+            edhrecPool,
+            mode: genMode,
+            existingCards: genMode === 'optimize' ? analysis.all_cards : null,
+            apiKey,
+            onProgress: setProgress,
+          });
+
+          setGenerated(result);
+          saveToCache(cacheKey, result);
+          setRunning(false);
+        } catch (e) {
+          setError(e.message);
+          setRunning(false);
+        }
+      };
+
+      const handleClearCache = () => {
+        localStorage.removeItem(CACHE_PREFIX + cacheKey);
+        setGenerated(null);
+      };
+
+      const handleCopyDecklist = () => {
+        if (!generated) return;
+        const lines = [`1 ${generated.commander_name}`];
+        // raggruppa per category in ordine logico
+        generated.cards.forEach(c => {
+          lines.push(`1 ${c.name}`);
+        });
+        navigator.clipboard.writeText(lines.join('\n'));
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      };
+
+      // Carica eventuale cache al cambio mode
+      useEffect(() => {
+        const cached = loadFromCache(cacheKey);
+        if (cached) setGenerated(cached);
+        else setGenerated(null);
+      }, [cacheKey]);
+
+      if (running) {
+        return (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-8 text-center">
+            <div className="inline-block w-10 h-10 border-4 border-amber-500/30 border-t-amber-500 rounded-full animate-spin mb-4"></div>
+            <div className="text-zinc-300 font-medium mb-1">{progress.phase}</div>
+            {progress.total > 0 && (
+              <div className="text-xs text-zinc-500">
+                Step {progress.step} di {progress.total}
+              </div>
+            )}
+            <p className="text-xs text-zinc-600 mt-3">Operazione lunga (60-90 sec). Non chiudere la pagina.</p>
+          </div>
+        );
+      }
+
+      if (!generated) {
+        const archCtx = getEffectiveArchetypeContext(data);
+        return (
+          <div className="space-y-4">
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+              <h3 className="text-lg font-semibold mb-2">Genera lista ottimizzata</h3>
+              <p className="text-sm text-zinc-400 mb-4">
+                Claude userà il pool EDHREC del tuo commander e curerà 99 carte ottimizzate per la strategia.
+              </p>
+
+              <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3 mb-4">
+                <div className="text-xs text-zinc-500 mb-1">Strategia attiva</div>
+                <div className="text-sm text-zinc-200 font-medium">{archCtx.label}</div>
+                {archCtx.description && (
+                  <div className="text-xs text-zinc-400 mt-1">{archCtx.description}</div>
+                )}
+                <div className="mt-2 text-xs text-zinc-500">
+                  Bracket target: <span className="text-amber-400 font-medium">{data.bracketTarget}</span>
+                </div>
+              </div>
+
+              <label className="block text-sm font-medium text-zinc-300 mb-2">Modalità generazione</label>
+              <div className="flex bg-zinc-950 border border-zinc-800 rounded-lg p-1 mb-3">
+                <button
+                  onClick={() => setGenMode('fromScratch')}
+                  className={`flex-1 px-3 py-1.5 text-xs font-medium rounded ${
+                    genMode === 'fromScratch' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  Da zero
+                </button>
+                <button
+                  onClick={() => setGenMode('optimize')}
+                  className={`flex-1 px-3 py-1.5 text-xs font-medium rounded ${
+                    genMode === 'optimize' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  Ottimizza il mazzo attuale
+                </button>
+              </div>
+              <p className="text-xs text-zinc-500 mb-4">
+                {genMode === 'fromScratch'
+                  ? 'Costruisce 99 carte partendo solo da commander + strategia + bracket. Ignora il mazzo attuale.'
+                  : 'Parte dal mazzo attuale e lo riscrive tenendo le carte chiave, sostituendo le deboli e ottimizzando per la strategia.'}
+              </p>
+
+              <p className="text-xs text-zinc-500 mb-4">
+                Tempo: 60-90 secondi · Costo stimato: 50-80 centesimi · Risultato salvato in cache
+              </p>
+
+              <button
+                onClick={handleRun}
+                className="w-full bg-amber-500 hover:bg-amber-400 text-black font-semibold py-2.5 rounded-lg"
+              >
+                Genera lista
+              </button>
+              {error && <div className="mt-3 text-sm text-red-400">{error}</div>}
+            </div>
+          </div>
+        );
+      }
+
+      // Risultati
+      const counts = {
+        land: generated.cards.filter(c => c.category === 'land').length,
+        ramp: generated.cards.filter(c => c.category === 'ramp').length,
+        draw: generated.cards.filter(c => c.category === 'draw').length,
+        removal: generated.cards.filter(c => c.category === 'removal').length,
+        threat: generated.cards.filter(c => c.category === 'threat').length,
+        protection: generated.cards.filter(c => c.category === 'protection').length,
+        win_con: generated.cards.filter(c => c.category === 'win_con').length,
+        engine: generated.cards.filter(c => c.category === 'engine').length,
+        utility: generated.cards.filter(c => c.category === 'utility').length,
+        tribal: generated.cards.filter(c => c.category === 'tribal').length,
+        combo_piece: generated.cards.filter(c => c.category === 'combo_piece').length,
+        tutor: generated.cards.filter(c => c.category === 'tutor').length,
+        tutor: generated.cards.filter(c => c.category === 'tutor').length,
+      };
+      const total = generated.cards.length;
+      const notFoundCount = generated.cards.filter(c => c.found === false).length;
+      const filteredCards = filter === 'all' ? generated.cards : generated.cards.filter(c => c.category === filter);
+
+      return (
+        <div className="space-y-6">
+          {/* Header con info */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div>
+                <h3 className="text-lg font-semibold">Lista generata</h3>
+                <p className="text-xs text-zinc-500">
+                  {total} carte + commander · Bracket target {generated.bracket_target} · Generata {new Date(generated.generated_at).toLocaleString('it-IT')}
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={handleCopyDecklist}
+                  className="bg-amber-500 hover:bg-amber-400 text-black text-sm font-medium px-4 py-2 rounded-lg"
+                >
+                  {copied ? '✓ Copiato!' : 'Copia decklist'}
+                </button>
+                <button
+                  onClick={handleClearCache}
+                  className="bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm px-4 py-2 rounded-lg"
+                >
+                  ↻ Rigenera
+                </button>
+              </div>
+            </div>
+            {generated.build_notes && (
+              <p className="text-sm text-zinc-300 mt-3 bg-zinc-950 border border-zinc-800 rounded p-3">
+                <span className="text-xs text-zinc-500 uppercase">Note di costruzione</span><br />
+                {generated.build_notes}
+              </p>
+            )}
+            {notFoundCount > 0 && (
+              <p className="text-xs text-amber-400 mt-2">
+                ⚠ {notFoundCount} carte non trovate su Scryfall (potrebbero essere nomi imprecisi). Controllale prima di importare la lista.
+              </p>
+            )}
+          </div>
+
+          {/* Distribuzione */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+            <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-3">Distribuzione carte</h4>
+            <div className="grid grid-cols-3 md:grid-cols-6 gap-2 text-xs">
+              {Object.entries(counts).filter(([k,v]) => v > 0).map(([k, v]) => (
+                <div key={k} className="bg-zinc-950 border border-zinc-800 rounded p-2 text-center">
+                  <div className="text-lg font-bold text-zinc-100">{v}</div>
+                  <div className="text-[10px] text-zinc-500 uppercase">{k}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Toggle vista cards/testo */}
+          <div className="flex bg-zinc-900 border border-zinc-800 rounded-lg p-1 max-w-xs">
+            <button
+              onClick={() => setView('cards')}
+              className={`flex-1 px-3 py-1.5 text-sm font-medium rounded ${view === 'cards' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'}`}
+            >
+              Tabella
+            </button>
+            <button
+              onClick={() => setView('text')}
+              className={`flex-1 px-3 py-1.5 text-sm font-medium rounded ${view === 'text' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'}`}
+            >
+              Testo
+            </button>
+          </div>
+
+          {view === 'cards' && (
+            <>
+              {/* Filtri categoria */}
+              <div className="flex flex-wrap gap-1.5">
+                <button
+                  onClick={() => setFilter('all')}
+                  className={`px-3 py-1 text-xs rounded-full ${filter==='all' ? 'bg-amber-500 text-black font-medium' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
+                >
+                  Tutte ({total})
+                </button>
+                {Object.entries(counts).filter(([k,v]) => v > 0).map(([k, v]) => (
+                  <button
+                    key={k}
+                    onClick={() => setFilter(k)}
+                    className={`px-3 py-1 text-xs rounded-full ${filter===k ? 'bg-amber-500 text-black font-medium' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
+                  >
+                    {k} ({v})
+                  </button>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {filteredCards.map((c, i) => (
+                  <GenerateCardRow key={i} card={c} />
+                ))}
+              </div>
+            </>
+          )}
+
+          {view === 'text' && (
+            <div className="bg-zinc-950 border border-zinc-800 rounded-xl p-4">
+              <p className="text-xs text-zinc-500 mb-3">
+                Formato Moxfield/Arena. Click "Copia decklist" in alto per copiare tutto.
+              </p>
+              <pre className="text-xs font-mono text-zinc-200 whitespace-pre overflow-x-auto scrollbar-thin">
+{`Commander:
+1 ${generated.commander_name}
+
+Deck:
+${generated.cards.map(c => `1 ${c.name}${c.found === false ? '  // NON TROVATA' : ''}`).join('\n')}`}
+              </pre>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
     // FASE 4 — Recommendations: Cuts & Adds
     // ============================================================
 
@@ -1236,8 +1772,9 @@ ${cardList}`;
     }
 
     // Per ogni cut, chiede a Claude 3 alternative
-    async function generateAlternatives(cutCandidates, commander, profile, archetype, apiKey, onProgress) {
-      const archetypeLabel = ARCHETYPES[archetype]?.label || archetype;
+    async function generateAlternatives(cutCandidates, commander, profile, archetype, apiKey, onProgress, archetypeContext) {
+      const archetypeLabel = archetypeContext?.label || ARCHETYPES[archetype]?.label || archetype;
+      const archetypeFullContext = archetypeContext?.full_context || `Archetipo: ${archetypeLabel}`;
       const colorIdentity = (commander.color_identity || []).join('') || 'C';
       const sys = `Sei un esperto di Magic: The Gathering Commander. Per ogni carta da tagliare, suggerisci 3 alternative di sostituzione classificate per intento. Conosci bene il pool di carte disponibili e i prezzi indicativi su Cardmarket. Rispondi SOLO con JSON valido, senza markdown fences.`;
 
@@ -1247,7 +1784,8 @@ ${cardList}`;
         const cand = cutCandidates[i];
         const card = cand.card;
 
-        const usr = `COMANDANTE: ${commander.name} | Color identity: ${colorIdentity} | Archetipo: ${archetypeLabel}
+        const usr = `COMANDANTE: ${commander.name} | Color identity: ${colorIdentity}
+STRATEGIA: ${archetypeFullContext}
 PROFILO COMMANDER: ${JSON.stringify(profile).slice(0, 600)}
 
 CARTA DA TAGLIARE: ${card.name}
@@ -1338,12 +1876,12 @@ Rispondi con questo JSON:
     }
 
     // Filtra le top inclusions EDHREC con Claude per tenere solo le veramente sinergiche
-    async function filterAddsWithClaude(edhrecCards, currentDeckNames, commander, profile, archetype, apiKey, maxAdds = 8) {
+    async function filterAddsWithClaude(edhrecCards, currentDeckNames, commander, profile, archetype, apiKey, maxAdds = 8, archetypeContext) {
       if (edhrecCards.length === 0) return [];
-      const archetypeLabel = ARCHETYPES[archetype]?.label || archetype;
+      const archetypeLabel = archetypeContext?.label || ARCHETYPES[archetype]?.label || archetype;
+      const archetypeFullContext = archetypeContext?.full_context || `Archetipo: ${archetypeLabel}`;
       const inDeck = new Set(currentDeckNames.map(n => n.toLowerCase()));
 
-      // Pre-filtra: solo carte non già nel mazzo, top 30 per synergy EDHREC
       const candidates = edhrecCards
         .filter(c => !inDeck.has(c.name.toLowerCase()))
         .sort((a, b) => (b.synergy || 0) - (a.synergy || 0))
@@ -1357,7 +1895,7 @@ Rispondi con questo JSON:
 
       const usr = `COMANDANTE: ${commander.name}
 PROFILO: ${JSON.stringify(profile).slice(0, 500)}
-ARCHETIPO: ${archetypeLabel}
+STRATEGIA: ${archetypeFullContext}
 
 Carte popolari nelle liste EDHREC per questo commander:
 ${list}
@@ -1508,7 +2046,10 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
       const [error, setError] = useState('');
       const [view, setView] = useState('cuts');
 
-      const cacheKey = `recs_${data.commander?.name}_${data.archetype}`;
+      const cacheKey = useMemo(() => {
+        const archCtx = getEffectiveArchetypeContext(data);
+        return `recs_${data.commander?.name}_${archCtx.mode}_${archCtx.label}_${(archCtx.description || '').slice(0,40)}_b${data.bracketTarget}`;
+      }, [data]);
 
       const handleRun = async () => {
         if (!apiKey) { onApiKeyMissing(); return; }
@@ -1529,13 +2070,15 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           }
 
           setProgress({ current: 0, total: candidates.length + 2, phase: 'Genero alternative per ogni cut...' });
+          const archetypeContext = getEffectiveArchetypeContext(data);
           const cuts = await generateAlternatives(
             candidates,
             data.commander,
             synergies.profile,
             data.archetype,
             apiKey,
-            (curr, total) => setProgress({ current: curr, total: total + 2, phase: 'Genero alternative per ogni cut...' })
+            (curr, total) => setProgress({ current: curr, total: total + 2, phase: 'Genero alternative per ogni cut...' }),
+            archetypeContext
           );
 
           // Aggiungi cardData per immagini
@@ -1557,7 +2100,8 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
             synergies.profile,
             data.archetype,
             apiKey,
-            8
+            8,
+            archetypeContext
           );
 
           const result = { cuts, adds, generatedAt: new Date().toISOString() };
@@ -2219,7 +2763,9 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
 
     function InputStep({ onAnalyze }) {
       const [decklist, setDecklist] = useState('');
+      const [archetypeMode, setArchetypeMode] = useState('preset'); // preset | auto | custom
       const [archetype, setArchetype] = useState('midrange');
+      const [customStrategy, setCustomStrategy] = useState('');
       const [bracketTarget, setBracketTarget] = useState(3);
       const [error, setError] = useState('');
 
@@ -2233,16 +2779,19 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           setError(`Ho letto solo ${parsed.cards.length} carte. Sei sicuro che la decklist sia completa?`);
           return;
         }
+        if (archetypeMode === 'custom' && customStrategy.trim().length < 20) {
+          setError('La descrizione personalizzata deve essere almeno 20 caratteri.');
+          return;
+        }
         setError('');
-        onAnalyze({ ...parsed, archetype, bracketTarget });
+        onAnalyze({
+          ...parsed,
+          archetype,
+          archetypeMode,
+          customStrategy: customStrategy.trim(),
+          bracketTarget,
+        });
       };
-
-      const exampleDeck = `1 Atraxa, Praetors' Voice
-1 Sol Ring
-1 Arcane Signet
-1 Command Tower
-1 Cultivate
-...`;
 
       return (
         <div className="max-w-3xl mx-auto">
@@ -2257,38 +2806,93 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
               value={decklist}
               onChange={e => setDecklist(e.target.value)}
               placeholder={"Commander:\n1 Atraxa, Praetors' Voice\n\n1 Sol Ring\n1 Cultivate\n..."}
-              className="w-full h-72 bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm font-mono text-zinc-200 resize-none focus:outline-none focus:border-amber-500/50 scrollbar-thin"
+              className="w-full h-64 bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm font-mono text-zinc-200 resize-none focus:outline-none focus:border-amber-500/50 scrollbar-thin"
             />
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-1.5">Archetipo</label>
-                <select
-                  value={archetype}
-                  onChange={e => setArchetype(e.target.value)}
-                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-2.5 text-sm focus:outline-none focus:border-amber-500/50"
+            {/* Selettore modalità archetipo */}
+            <div className="mt-5">
+              <label className="block text-sm font-medium text-zinc-300 mb-2">Come definisci l'archetipo del mazzo?</label>
+              <div className="flex bg-zinc-950 border border-zinc-800 rounded-lg p-1 mb-3">
+                <button
+                  onClick={() => setArchetypeMode('preset')}
+                  className={`flex-1 px-3 py-1.5 text-xs font-medium rounded ${
+                    archetypeMode === 'preset' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
                 >
-                  {Object.entries(ARCHETYPES).map(([k, v]) => (
-                    <option key={k} value={k}>{v.label}</option>
-                  ))}
-                </select>
-                <p className="text-xs text-zinc-500 mt-1">{ARCHETYPES[archetype].description}</p>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-1.5">Bracket target</label>
-                <select
-                  value={bracketTarget}
-                  onChange={e => setBracketTarget(parseInt(e.target.value))}
-                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-2.5 text-sm focus:outline-none focus:border-amber-500/50"
+                  Preset rapido
+                </button>
+                <button
+                  onClick={() => setArchetypeMode('auto')}
+                  className={`flex-1 px-3 py-1.5 text-xs font-medium rounded ${
+                    archetypeMode === 'auto' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
                 >
-                  <option value={1}>1 — Exhibition</option>
-                  <option value={2}>2 — Core</option>
-                  <option value={3}>3 — Upgraded</option>
-                  <option value={4}>4 — Optimized</option>
-                  <option value={5}>5 — cEDH</option>
-                </select>
-                <p className="text-xs text-zinc-500 mt-1">Bracket assessment arriverà nella prossima fase</p>
+                  Auto-rileva
+                </button>
+                <button
+                  onClick={() => setArchetypeMode('custom')}
+                  className={`flex-1 px-3 py-1.5 text-xs font-medium rounded ${
+                    archetypeMode === 'custom' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  Personalizzato
+                </button>
               </div>
+
+              {archetypeMode === 'preset' && (
+                <div>
+                  <select
+                    value={archetype}
+                    onChange={e => setArchetype(e.target.value)}
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-2.5 text-sm focus:outline-none focus:border-amber-500/50"
+                  >
+                    {Object.entries(ARCHETYPES).map(([k, v]) => (
+                      <option key={k} value={k}>{v.label}</option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-zinc-500 mt-1">{ARCHETYPES[archetype].description}</p>
+                </div>
+              )}
+
+              {archetypeMode === 'auto' && (
+                <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3">
+                  <p className="text-xs text-zinc-400">
+                    Claude leggerà tutto il mazzo e dedurrà archetipo principale, sotto-temi e piano di gioco. Costo aggiuntivo: ~2 centesimi.
+                  </p>
+                  <p className="text-xs text-amber-400 mt-1.5">
+                    Richiede chiave API Claude (te la chiederò se non l'hai impostata).
+                  </p>
+                </div>
+              )}
+
+              {archetypeMode === 'custom' && (
+                <div>
+                  <textarea
+                    value={customStrategy}
+                    onChange={e => setCustomStrategy(e.target.value)}
+                    placeholder={"Esempio: Voltron primario con Voja, vinco con commander damage potenziato dai +1/+1 counters. Sotto-tema lupi/umani come scudo. Voglio resistere a board wipe. No combo infinite."}
+                    className="w-full h-24 bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm text-zinc-200 resize-none focus:outline-none focus:border-amber-500/50"
+                  />
+                  <p className="text-xs text-zinc-500 mt-1">
+                    Descrivi in italiano come deve giocare il mazzo. Più sei specifico, meglio Claude calibrerà l'analisi.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-4">
+              <label className="block text-sm font-medium text-zinc-300 mb-1.5">Bracket target</label>
+              <select
+                value={bracketTarget}
+                onChange={e => setBracketTarget(parseInt(e.target.value))}
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-2.5 text-sm focus:outline-none focus:border-amber-500/50"
+              >
+                <option value={1}>1 — Exhibition</option>
+                <option value={2}>2 — Core</option>
+                <option value={3}>3 — Upgraded</option>
+                <option value={4}>4 — Optimized</option>
+                <option value={5}>5 — cEDH</option>
+              </select>
             </div>
 
             {error && (
@@ -2316,6 +2920,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
     function ConfirmStep({ data, onConfirm, onBack }) {
       const cmdr = data.commander;
       const ci = cmdr?.color_identity || [];
+      const archCtx = getEffectiveArchetypeContext(data);
 
       return (
         <div className="max-w-3xl mx-auto">
@@ -2338,7 +2943,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
                 </div>
                 <div className="mt-3 text-sm text-zinc-300">
                   <div>Carte totali nel mazzo: <span className="font-semibold text-zinc-100">{data.cards.length}</span></div>
-                  <div>Archetipo selezionato: <span className="font-semibold text-zinc-100">{ARCHETYPES[data.archetype].label}</span></div>
+                  <div>Bracket target: <span className="font-semibold text-zinc-100">{data.bracketTarget}</span></div>
                   {data.notFound && data.notFound.length > 0 && (
                     <div className="mt-2 text-amber-400">
                       Non trovate su Scryfall ({data.notFound.length}): {data.notFound.slice(0,3).join(', ')}{data.notFound.length > 3 ? '…' : ''}
@@ -2346,6 +2951,38 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
                   )}
                 </div>
               </div>
+            </div>
+
+            {/* Box modalità archetipo */}
+            <div className="mt-4 bg-zinc-950 border border-zinc-800 rounded-lg p-4">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-xs text-zinc-500 uppercase tracking-wider">Strategia / archetipo</span>
+                {data.archetypeMode === 'preset' && <span className="text-[10px] bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded">Preset</span>}
+                {data.archetypeMode === 'auto' && <span className="text-[10px] bg-amber-900/40 text-amber-300 px-2 py-0.5 rounded">Auto-rilevato</span>}
+                {data.archetypeMode === 'custom' && <span className="text-[10px] bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded">Personalizzato</span>}
+              </div>
+              <div className="text-sm font-medium text-zinc-200">{archCtx.label}</div>
+              {archCtx.description && (
+                <p className="text-xs text-zinc-400 mt-1.5">{archCtx.description}</p>
+              )}
+              {data.archetypeMode === 'auto' && data.autoDetected?.secondary_themes && data.autoDetected.secondary_themes.length > 0 && (
+                <div className="mt-2">
+                  <span className="text-[10px] text-zinc-500 uppercase">Sotto-temi rilevati:</span>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {data.autoDetected.secondary_themes.map((t, i) => (
+                      <span key={i} className="text-[10px] bg-purple-900/30 text-purple-300 px-1.5 py-0.5 rounded">{t}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {data.archetypeMode === 'auto' && data.autoDetected?.win_conditions && (
+                <div className="mt-2">
+                  <span className="text-[10px] text-zinc-500 uppercase">Win conditions:</span>
+                  <ul className="text-xs text-zinc-400 list-disc list-inside mt-0.5">
+                    {data.autoDetected.win_conditions.map((w, i) => <li key={i}>{w}</li>)}
+                  </ul>
+                </div>
+              )}
             </div>
 
             <div className="flex gap-2 mt-6">
@@ -2379,7 +3016,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
       );
     }
 
-    function ResultsView({ data, analysis, scores, onReset, apiKey, onApiKeyMissing, synergies, setSynergies, recommendations, setRecommendations }) {
+    function ResultsView({ data, analysis, scores, onReset, apiKey, onApiKeyMissing, synergies, setSynergies, recommendations, setRecommendations, generated, setGenerated }) {
       const [tab, setTab] = useState('overview');
       const dimNames = {
         mana_base: 'Mana base',
@@ -2460,6 +3097,16 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
               }`}
             >
               Cuts &amp; Adds {recommendations && <span className="text-emerald-400 text-xs">●</span>}
+            </button>
+            <button
+              onClick={() => setTab('generate')}
+              className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px flex items-center gap-2 ${
+                tab === 'generate'
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              Genera {generated && <span className="text-emerald-400 text-xs">●</span>}
             </button>
           </div>
 
@@ -2615,6 +3262,17 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
               synergies={synergies}
               recommendations={recommendations}
               setRecommendations={setRecommendations}
+            />
+          )}
+
+          {tab === 'generate' && (
+            <GenerateTab
+              analysis={analysis}
+              data={data}
+              apiKey={apiKey}
+              onApiKeyMissing={onApiKeyMissing}
+              generated={generated}
+              setGenerated={setGenerated}
             />
           )}
         </div>
@@ -2786,17 +3444,24 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
       const [showApiKeyModal, setShowApiKeyModal] = useState(false);
       const [synergies, setSynergies] = useState(null);
       const [recommendations, setRecommendations] = useState(null);
+      const [generated, setGenerated] = useState(null);
+
+      // Cache key che incorpora la modalità archetipo
+      function buildCacheKey(prefix, d) {
+        if (!d?.commander) return null;
+        const archCtx = getEffectiveArchetypeContext(d);
+        return `${prefix}_${d.commander.name}_${archCtx.mode}_${archCtx.label}_${(archCtx.description || '').slice(0,40)}_b${d.bracketTarget}`;
+      }
 
       // Quando arriviamo alla schermata risultati, prova a caricare le sinergie e raccomandazioni dalla cache
       useEffect(() => {
         if (phase === 'results' && data?.commander) {
-          const synKey = `synergies_${data.commander.name}_${data.archetype}`;
-          const recKey = `recs_${data.commander.name}_${data.archetype}`;
-          const cachedSyn = loadFromCache(synKey);
-          const cachedRec = loadFromCache(recKey);
+          const synKey = buildCacheKey('synergies', data);
+          const recKey = buildCacheKey('recs', data);
+          const cachedSyn = synKey ? loadFromCache(synKey) : null;
+          const cachedRec = recKey ? loadFromCache(recKey) : null;
           setSynergies(cachedSyn || null);
           setRecommendations(cachedRec || null);
-          // Re-popola cardData per immagini in cuts
           if (cachedRec?.cuts && data.cards) {
             cachedRec.cuts.forEach(c => {
               const cd = data.cards.find(card => card.name === c.card);
@@ -2821,13 +3486,11 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
             })
             .filter(Boolean);
 
-          // Determina commander se non già marcato
           let commander = enriched.find(c => c.isCommander);
           if (!commander && parsedData.commanderHint) {
             commander = enriched.find(c => c.name.toLowerCase() === parsedData.commanderHint.toLowerCase());
             if (commander) commander.isCommander = true;
           }
-          // Fallback: se nessun commander e c'è una carta legendary creature unica
           if (!commander) {
             const legendaries = enriched.filter(c =>
               c.type_line.toLowerCase().includes('legendary') &&
@@ -2839,13 +3502,39 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
             }
           }
 
-          setData({
+          let initialData = {
             cards: enriched,
             commander,
             archetype: parsedData.archetype,
+            archetypeMode: parsedData.archetypeMode,
+            customStrategy: parsedData.customStrategy,
             bracketTarget: parsedData.bracketTarget,
             notFound,
-          });
+            autoDetected: null,
+          };
+
+          // Se modalità auto, lancia auto-detect
+          if (parsedData.archetypeMode === 'auto' && commander) {
+            if (!apiKey) {
+              setShowApiKeyModal(true);
+              setError('Per usare auto-rileva serve la chiave API Claude. Impostala e riprova.');
+              setPhase('error');
+              return;
+            }
+            try {
+              const detected = await autoDetectArchetype(commander, enriched, apiKey);
+              initialData.autoDetected = detected;
+              // Se Claude ha identificato un primary_archetype valido, settalo come archetype effettivo
+              if (detected?.primary_archetype && ARCHETYPES[detected.primary_archetype]) {
+                initialData.archetype = detected.primary_archetype;
+              }
+            } catch (e) {
+              console.error('Auto-detect failed:', e);
+              // Continua comunque con archetipo midrange di default
+            }
+          }
+
+          setData(initialData);
           setPhase('confirm');
         } catch (e) {
           setError(e.message);
@@ -2879,6 +3568,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
         setScores(null);
         setSynergies(null);
         setRecommendations(null);
+        setGenerated(null);
         setError('');
       };
 
@@ -2900,7 +3590,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
             <StepIndicator current={step} />
 
             {phase === 'input' && <InputStep onAnalyze={handleAnalyze} />}
-            {phase === 'fetching' && <LoadingScreen message="Sto recuperando le carte da Scryfall…" />}
+            {phase === 'fetching' && <LoadingScreen message={data?.archetypeMode === 'auto' ? "Recupero le carte e auto-rilevo l'archetipo…" : "Sto recuperando le carte da Scryfall…"} />}
             {phase === 'confirm' && data && <ConfirmStep data={data} onConfirm={handleConfirm} onBack={handleReset} />}
             {phase === 'analyzing' && <LoadingScreen message="Sto analizzando il mazzo…" />}
             {phase === 'results' && analysis && scores && (
@@ -2915,6 +3605,8 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
                 setSynergies={setSynergies}
                 recommendations={recommendations}
                 setRecommendations={setRecommendations}
+                generated={generated}
+                setGenerated={setGenerated}
               />
             )}
             {phase === 'error' && <ErrorScreen error={error} onBack={handleReset} />}
@@ -2927,7 +3619,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.4 · Synergy + Bracket + Recommendations · Scryfall + Claude + Spellbook + EDHREC · Prezzi via Cardmarket
+            v0.5 · Synergy + Bracket + Recommendations + Generator · 3 modalità archetipo · Scryfall + Claude + Spellbook + EDHREC
           </footer>
         </div>
       );
