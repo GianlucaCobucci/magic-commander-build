@@ -702,6 +702,514 @@ ${cardList}`;
     }
 
     // ============================================================
+    // FASE 3 — Bracket Assessment + Combo Detection
+    // ============================================================
+
+    // Game Changers list ufficiale WotC (snapshot)
+    // Fonte: https://magic.wizards.com/en/news/announcements/introducing-commander-brackets-beta
+    // Lista da aggiornare manualmente quando WotC rilascia nuove revisioni.
+    const GAME_CHANGERS = new Set([
+      // Mass Land Denial enabler / fast mana
+      "Ancient Tomb",
+      "Chrome Mox",
+      "Mana Vault",
+      "Mox Diamond",
+      "Mishra's Workshop",
+      "The One Ring",
+      "Trinisphere",
+      // Combo enabler / lock pieces
+      "Aetherflux Reservoir",
+      "Bolas's Citadel",
+      "Coalition Victory",
+      "Demonic Tutor",
+      "Dockside Extortionist",
+      "Drannith Magistrate",
+      "Enlightened Tutor",
+      "Field of the Dead",
+      "Fierce Guardianship",
+      "Force of Will",
+      "Gaea's Cradle",
+      "Glacial Chasm",
+      "Grand Arbiter Augustin IV",
+      "Grim Monolith",
+      "Humility",
+      "Imperial Seal",
+      "Intuition",
+      "Jeska's Will",
+      "Jin-Gitaxias, Core Augur",
+      "Kinnan, Bonder Prodigy",
+      "Lion's Eye Diamond",
+      "Mana Drain",
+      "Mox Vault",
+      "Mystical Tutor",
+      "Natural Order",
+      "Necropotence",
+      "Notion Thief",
+      "Opposition Agent",
+      "Orcish Bowmasters",
+      "Panoptic Mirror",
+      "Rhystic Study",
+      "Seedborn Muse",
+      "Serra's Sanctum",
+      "Smothering Tithe",
+      "Survival of the Fittest",
+      "Sway of the Stars",
+      "Tergrid, God of Fright",
+      "Thassa's Oracle",
+      "The Tabernacle at Pendrell Vale",
+      "Thoracle",
+      "Trinket Mage",
+      "True-Name Nemesis",
+      "Underworld Breach",
+      "Urza, Lord High Artificer",
+      "Vampiric Tutor",
+      "Vorinclex, Voice of Hunger",
+      "Winota, Joiner of Forces",
+      "Yuriko, the Tiger's Shadow",
+      // Tutori free / instant
+      "Worldly Tutor",
+      "Vampiric Tutor",
+      "Mystical Tutor",
+      "Enlightened Tutor",
+      // Stax pieces aggressivi
+      "Stasis",
+      "Winter Orb",
+      "Static Orb",
+      "Tangle Wire",
+      "Armageddon",
+      "Ravages of War",
+      "Cataclysm",
+      // Extra turn loop enabler
+      "Time Warp",
+      "Temporal Manipulation",
+      "Capture of Jingzhou",
+      "Walk the Aeons",
+      "Nexus of Fate",
+      "Beacon of Tomorrows",
+    ]);
+
+    // Carte considerate Mass Land Destruction (o effetti equivalenti)
+    const MLD_NAMES_EXTRA = new Set([
+      "Armageddon", "Catastrophe", "Cataclysm", "Decree of Annihilation",
+      "Destructive Force", "Devastation", "Jokulhaups", "Obliterate",
+      "Ravages of War", "Wildfire", "Worldfire", "Burning Sands",
+      "Sunder", "Boom // Bust", "Bust", "Tectonic Break",
+      "Mana Vortex", "Boil", "Boiling Seas", "Death Cloud",
+      "Decimate", "Plow Under", "Ruination", "Magus of the Tabernacle",
+    ]);
+
+    function detectBracketFactors(cards) {
+      const factors = {
+        gameChangers: [],
+        mld: [],
+        extraTurns: [],
+        tutorsUnconditional: [],
+        infiniteCombosNote: false,
+      };
+
+      cards.forEach(c => {
+        if (GAME_CHANGERS.has(c.name)) factors.gameChangers.push(c.name);
+        if (c.tags?.includes('mld') || MLD_NAMES_EXTRA.has(c.name)) {
+          if (!factors.mld.includes(c.name)) factors.mld.push(c.name);
+        }
+        if (c.tags?.includes('extra_turn')) factors.extraTurns.push(c.name);
+        if (c.tags?.includes('tutor_unconditional')) factors.tutorsUnconditional.push(c.name);
+      });
+
+      return factors;
+    }
+
+    function estimateBracket(factors, combos, archetype) {
+      // Logica:
+      // - 0 Game Changer + 0 MLD + 0 extra turn + tutor <=1 → bracket 2
+      // - 1-2 Game Changer e niente combo → bracket 3
+      // - 3+ Game Changer OR MLD OR 2+ extra turn OR combo → bracket 4
+      // - Archetipo cEDH OR (combo + tutor>=4 + GC>=3) → bracket 5
+      const gcCount = factors.gameChangers.length;
+      const mldCount = factors.mld.length;
+      const etCount = factors.extraTurns.length;
+      const tutorCount = factors.tutorsUnconditional.length;
+      const comboCount = combos.length;
+      const isCedhArch = archetype.startsWith('cedh');
+
+      const drivers = [];
+      let bracket = 2;
+
+      if (isCedhArch) {
+        bracket = 5;
+        drivers.push(`Archetipo dichiarato cEDH (${archetype})`);
+      }
+
+      if (gcCount >= 3) {
+        bracket = Math.max(bracket, 4);
+        drivers.push(`${gcCount} Game Changer presenti (soglia ≥3 → bracket 4)`);
+      } else if (gcCount >= 1) {
+        bracket = Math.max(bracket, 3);
+        drivers.push(`${gcCount} Game Changer presenti (soglia ≥1 → bracket 3)`);
+      }
+
+      if (mldCount >= 1) {
+        bracket = Math.max(bracket, 4);
+        drivers.push(`${mldCount} carte di Mass Land Destruction → bracket 4 minimo`);
+      }
+
+      if (etCount >= 2) {
+        bracket = Math.max(bracket, 4);
+        drivers.push(`${etCount} extra turn (chain potenziale) → bracket 4 minimo`);
+      } else if (etCount === 1) {
+        bracket = Math.max(bracket, 3);
+        drivers.push(`1 carta extra turn → bracket 3 minimo`);
+      }
+
+      if (comboCount >= 1) {
+        bracket = Math.max(bracket, 3);
+        drivers.push(`${comboCount} combo certificate da Commander Spellbook`);
+        if (comboCount >= 2) {
+          bracket = Math.max(bracket, 4);
+          drivers.push(`Multiple combo (≥2) → bracket 4 minimo`);
+        }
+      }
+
+      if (tutorCount >= 5) {
+        bracket = Math.max(bracket, 4);
+        drivers.push(`${tutorCount} tutor incondizionati → tendenza bracket 4`);
+      } else if (tutorCount >= 3) {
+        bracket = Math.max(bracket, 3);
+        drivers.push(`${tutorCount} tutor incondizionati`);
+      }
+
+      // Se è cEDH e ci sono combo + tutor pesanti, push a 5
+      if (gcCount >= 5 && tutorCount >= 4 && comboCount >= 1) {
+        bracket = 5;
+        if (!drivers.find(d => d.startsWith('Archetipo'))) {
+          drivers.push('Densità Game Changer + tutor + combo da bracket 5');
+        }
+      }
+
+      // Se nessun driver, è un mazzo "casual"
+      if (drivers.length === 0) {
+        drivers.push('Nessun indicatore di power level alto rilevato');
+      }
+
+      return { bracket, drivers };
+    }
+
+    async function fetchCommanderSpellbookCombos(cards) {
+      // Commander Spellbook API: usiamo l'endpoint find-my-combos
+      // POST con la lista dei nomi carta
+      try {
+        const cardNames = cards.map(c => c.name);
+        const res = await fetch('https://backend.commanderspellbook.com/find-my-combos', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            commanders: cards.filter(c => c.isCommander).map(c => c.name),
+            main: cardNames,
+          }),
+        });
+        if (!res.ok) {
+          // L'API può variare; non fare crashare l'app
+          console.warn('Commander Spellbook risposta non ok:', res.status);
+          return [];
+        }
+        const json = await res.json();
+        // L'API risponde con {results: {included: [...combos]}} o simile a seconda della versione
+        // Normalizziamo per sicurezza
+        const combos = json.results?.included || json.included || json.results || [];
+        return combos.map(c => ({
+          id: c.id,
+          name: c.name || (c.uses ? c.uses.map(u => u.card?.name || u.name).join(' + ') : 'Combo'),
+          uses: (c.uses || []).map(u => u.card?.name || u.name).filter(Boolean),
+          produces: (c.produces || []).map(p => p.feature?.name || p.name).filter(Boolean),
+          description: c.description || '',
+          notes: c.notes || '',
+        })).filter(c => c.uses && c.uses.length > 0);
+      } catch (e) {
+        console.warn('Errore Commander Spellbook:', e);
+        return [];
+      }
+    }
+
+    // ============================================================
+    // COMPONENTI FASE 3 — Tab Bracket
+    // ============================================================
+
+    function BracketBadge({ bracket, big }) {
+      const colors = {
+        1: 'bg-emerald-900/40 border-emerald-700 text-emerald-300',
+        2: 'bg-blue-900/40 border-blue-700 text-blue-300',
+        3: 'bg-amber-900/40 border-amber-700 text-amber-300',
+        4: 'bg-orange-900/40 border-orange-700 text-orange-300',
+        5: 'bg-red-900/40 border-red-700 text-red-300',
+      };
+      const labels = {
+        1: 'Exhibition',
+        2: 'Core',
+        3: 'Upgraded',
+        4: 'Optimized',
+        5: 'cEDH',
+      };
+      const cls = colors[bracket] || colors[2];
+      if (big) {
+        return (
+          <div className={`${cls} border rounded-xl p-4 text-center`}>
+            <div className="text-5xl font-bold">{bracket}</div>
+            <div className="text-sm mt-1 opacity-80">{labels[bracket]}</div>
+          </div>
+        );
+      }
+      return (
+        <span className={`${cls} border px-2 py-0.5 rounded text-xs font-semibold`}>
+          {bracket} · {labels[bracket]}
+        </span>
+      );
+    }
+
+    function BracketTab({ analysis, data }) {
+      const [combos, setCombos] = useState(null);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState('');
+
+      const factors = useMemo(() => detectBracketFactors(analysis.all_cards), [analysis]);
+      const bracketResult = useMemo(
+        () => estimateBracket(factors, combos || [], data.archetype),
+        [factors, combos, data.archetype]
+      );
+
+      const handleFetchCombos = async () => {
+        setLoading(true);
+        setError('');
+        try {
+          const result = await fetchCommanderSpellbookCombos(analysis.all_cards);
+          setCombos(result);
+        } catch (e) {
+          setError(e.message);
+          setCombos([]);
+        }
+        setLoading(false);
+      };
+
+      // Auto-fetch combos al primo render
+      useEffect(() => {
+        if (combos === null && !loading) {
+          handleFetchCombos();
+        }
+      }, []);
+
+      const target = data.bracketTarget;
+      const estimated = bracketResult.bracket;
+      const matchStatus = estimated === target ? 'match'
+                       : estimated > target ? 'over'
+                       : 'under';
+
+      return (
+        <div className="space-y-6">
+          {/* Bracket header */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+            <h3 className="text-sm font-semibold text-zinc-300 mb-4">Valutazione Bracket</h3>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
+              <div>
+                <div className="text-xs text-zinc-500 mb-1">Target dichiarato</div>
+                <BracketBadge bracket={target} big />
+              </div>
+              <div className="text-center">
+                {matchStatus === 'match' && (
+                  <div className="text-emerald-400">
+                    <div className="text-3xl">✓</div>
+                    <div className="text-sm font-medium mt-1">Coerente</div>
+                  </div>
+                )}
+                {matchStatus === 'over' && (
+                  <div className="text-amber-400">
+                    <div className="text-3xl">↑</div>
+                    <div className="text-sm font-medium mt-1">Più potente del target</div>
+                    <div className="text-xs text-zinc-500 mt-1">Il mazzo gioca a un bracket più alto di quello dichiarato</div>
+                  </div>
+                )}
+                {matchStatus === 'under' && (
+                  <div className="text-blue-400">
+                    <div className="text-3xl">↓</div>
+                    <div className="text-sm font-medium mt-1">Più debole del target</div>
+                    <div className="text-xs text-zinc-500 mt-1">Spazio per upgrade verso il bracket dichiarato</div>
+                  </div>
+                )}
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500 mb-1">Stimato dal mazzo</div>
+                <BracketBadge bracket={estimated} big />
+              </div>
+            </div>
+          </div>
+
+          {/* Drivers */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+            <h3 className="text-sm font-semibold text-zinc-300 mb-3">Cosa determina il bracket stimato</h3>
+            <ul className="space-y-2">
+              {bracketResult.drivers.map((d, i) => (
+                <li key={i} className="text-sm text-zinc-300 flex items-start gap-2">
+                  <span className="text-amber-500 mt-0.5">▸</span>
+                  <span>{d}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {/* Game Changers */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-zinc-300">
+                Game Changers nel mazzo ({factors.gameChangers.length})
+              </h3>
+              <a href="https://magic.wizards.com/en/news/announcements/introducing-commander-brackets-beta"
+                 target="_blank" rel="noreferrer"
+                 className="text-xs text-zinc-500 hover:text-amber-400">
+                Cos'è la lista? ↗
+              </a>
+            </div>
+            {factors.gameChangers.length === 0 ? (
+              <p className="text-sm text-zinc-500">Nessuna carta dalla Game Changers list ufficiale.</p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {factors.gameChangers.map((name, i) => (
+                  <span key={i} className="text-xs bg-amber-900/30 border border-amber-700/40 text-amber-300 px-2 py-1 rounded">
+                    {name}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* MLD + Extra turns + Tutors */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Mass Land Destruction</h4>
+                <span className="text-2xl font-bold text-zinc-200">{factors.mld.length}</span>
+              </div>
+              {factors.mld.length === 0 ? (
+                <p className="text-xs text-zinc-500">Nessuna MLD rilevata.</p>
+              ) : (
+                <div className="space-y-1">
+                  {factors.mld.map((n, i) => (
+                    <div key={i} className="text-xs text-zinc-400">{n}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Extra Turns</h4>
+                <span className="text-2xl font-bold text-zinc-200">{factors.extraTurns.length}</span>
+              </div>
+              {factors.extraTurns.length === 0 ? (
+                <p className="text-xs text-zinc-500">Nessun extra turn.</p>
+              ) : (
+                <div className="space-y-1">
+                  {factors.extraTurns.map((n, i) => (
+                    <div key={i} className="text-xs text-zinc-400">{n}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Tutor Incondizionati</h4>
+                <span className="text-2xl font-bold text-zinc-200">{factors.tutorsUnconditional.length}</span>
+              </div>
+              {factors.tutorsUnconditional.length === 0 ? (
+                <p className="text-xs text-zinc-500">Nessun tutor incondizionato.</p>
+              ) : (
+                <div className="space-y-1">
+                  {factors.tutorsUnconditional.map((n, i) => (
+                    <div key={i} className="text-xs text-zinc-400">{n}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Combo certificate */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-zinc-300">
+                Combo certificate {combos !== null && `(${combos.length})`}
+              </h3>
+              <div className="flex items-center gap-2">
+                <a href="https://commanderspellbook.com" target="_blank" rel="noreferrer"
+                   className="text-xs text-zinc-500 hover:text-amber-400">
+                  Commander Spellbook ↗
+                </a>
+                {combos !== null && (
+                  <button onClick={handleFetchCombos} disabled={loading}
+                          className="text-xs text-zinc-500 hover:text-amber-400">
+                    ↻ Aggiorna
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {loading && (
+              <div className="text-sm text-zinc-500 flex items-center gap-2">
+                <div className="w-4 h-4 border-2 border-amber-500/30 border-t-amber-500 rounded-full animate-spin"></div>
+                Cerco combo certificate...
+              </div>
+            )}
+            {error && <div className="text-sm text-red-400">Errore: {error}</div>}
+            {combos !== null && combos.length === 0 && !loading && (
+              <p className="text-sm text-zinc-500">Nessuna combo certificata rilevata da Commander Spellbook con queste carte.</p>
+            )}
+            {combos !== null && combos.length > 0 && (
+              <div className="space-y-3">
+                {combos.slice(0, 20).map((c, i) => (
+                  <div key={i} className="bg-zinc-950 border border-zinc-800 rounded-lg p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1">
+                        <div className="text-sm font-medium text-zinc-200 mb-1">
+                          {c.uses.join(' + ')}
+                        </div>
+                        {c.produces.length > 0 && (
+                          <div className="text-xs text-emerald-400 mb-1">
+                            → {c.produces.join(', ')}
+                          </div>
+                        )}
+                        {c.description && (
+                          <div className="text-xs text-zinc-500 mt-1 line-clamp-3">{c.description}</div>
+                        )}
+                      </div>
+                      {c.id && (
+                        <a href={`https://commanderspellbook.com/combo/${c.id}/`} target="_blank" rel="noreferrer"
+                           className="text-xs text-zinc-500 hover:text-amber-400 whitespace-nowrap">↗</a>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                {combos.length > 20 && (
+                  <p className="text-xs text-zinc-500 text-center">
+                    ...e altre {combos.length - 20} combo (mostriamo le prime 20)
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Reference card legenda bracket */}
+          <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-5">
+            <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-3">Riferimento bracket WotC</h4>
+            <div className="space-y-2 text-xs">
+              <div className="flex gap-3"><BracketBadge bracket={1} /><span className="text-zinc-400">Mazzi tematici, deboli, no carte forti</span></div>
+              <div className="flex gap-3"><BracketBadge bracket={2} /><span className="text-zinc-400">Livello precon, gioco lento e onesto</span></div>
+              <div className="flex gap-3"><BracketBadge bracket={3} /><span className="text-zinc-400">Precon potenziato, qualche Game Changer, no MLD/extra turn</span></div>
+              <div className="flex gap-3"><BracketBadge bracket={4} /><span className="text-zinc-400">Mazzi ottimizzati non-cEDH, tutto ammesso</span></div>
+              <div className="flex gap-3"><BracketBadge bracket={5} /><span className="text-zinc-400">Meta competitivo da torneo</span></div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ============================================================
     // FUNCTION TAGGING
     // analizza il testo della carta e applica tag funzionali
     // ============================================================
@@ -1442,6 +1950,16 @@ ${cardList}`;
             >
               Sinergie {synergies && <span className="text-emerald-400 text-xs">●</span>}
             </button>
+            <button
+              onClick={() => setTab('bracket')}
+              className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px ${
+                tab === 'bracket'
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              Bracket
+            </button>
           </div>
 
           {tab === 'overview' && (<React.Fragment>
@@ -1581,6 +2099,10 @@ ${cardList}`;
               synergies={synergies}
               setSynergies={setSynergies}
             />
+          )}
+
+          {tab === 'bracket' && (
+            <BracketTab analysis={analysis} data={data} />
           )}
         </div>
       );
@@ -1879,7 +2401,7 @@ ${cardList}`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.2 · Synergy engine · Scryfall + Claude · Prezzi via Cardmarket
+            v0.3 · Synergy + Bracket · Scryfall + Claude + Spellbook · Prezzi via Cardmarket
           </footer>
         </div>
       );
