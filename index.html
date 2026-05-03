@@ -1210,6 +1210,497 @@ ${cardList}`;
     }
 
     // ============================================================
+    // FASE 4 — Recommendations: Cuts & Adds
+    // ============================================================
+
+    // Seleziona i candidati al taglio dalle sinergie
+    function selectCutCandidates(synergies, cards, maxCuts = 8) {
+      if (!synergies?.scores) return [];
+      const candidates = [];
+      cards.forEach(c => {
+        if (c.isCommander) return;
+        if (c.tags?.includes('land')) return; // i lands non li tagliamo da qui
+        const syn = synergies.scores[c.name];
+        if (!syn) return;
+        // Priority: misfit (peggiori) > redundant > utility_generic con score basso
+        let priority = 0;
+        if (syn.category === 'misfit') priority = 100 - syn.score;
+        else if (syn.category === 'redundant') priority = 80 - syn.score;
+        else if (syn.category === 'utility_generic' && syn.score <= 5) priority = 60 - syn.score;
+        else if (syn.score <= 3) priority = 50 - syn.score;
+        else return; // non candidato
+        candidates.push({ card: c, synergy: syn, priority });
+      });
+      candidates.sort((a, b) => b.priority - a.priority);
+      return candidates.slice(0, maxCuts);
+    }
+
+    // Per ogni cut, chiede a Claude 3 alternative
+    async function generateAlternatives(cutCandidates, commander, profile, archetype, apiKey, onProgress) {
+      const archetypeLabel = ARCHETYPES[archetype]?.label || archetype;
+      const colorIdentity = (commander.color_identity || []).join('') || 'C';
+      const sys = `Sei un esperto di Magic: The Gathering Commander. Per ogni carta da tagliare, suggerisci 3 alternative di sostituzione classificate per intento. Conosci bene il pool di carte disponibili e i prezzi indicativi su Cardmarket. Rispondi SOLO con JSON valido, senza markdown fences.`;
+
+      const results = [];
+      for (let i = 0; i < cutCandidates.length; i++) {
+        if (onProgress) onProgress(i, cutCandidates.length);
+        const cand = cutCandidates[i];
+        const card = cand.card;
+
+        const usr = `COMANDANTE: ${commander.name} | Color identity: ${colorIdentity} | Archetipo: ${archetypeLabel}
+PROFILO COMMANDER: ${JSON.stringify(profile).slice(0, 600)}
+
+CARTA DA TAGLIARE: ${card.name}
+TIPO: ${card.type_line}
+COSTO: ${card.mana_cost} (CMC ${card.cmc})
+TESTO: ${card.oracle_text}
+MOTIVO TAGLIO: ${cand.synergy.reasoning} (categoria: ${cand.synergy.category}, score ${cand.synergy.score}/10)
+
+Suggerisci 3 alternative legali nella color identity ${colorIdentity}, NON già nel mazzo, classificate così:
+
+1. POWERCREEP: stessa funzione ma più potente. Tipicamente più cara su Cardmarket.
+2. LATERALE: stessa funzione, sapore diverso o specificità diversa. Prezzo simile o inferiore.
+3. TEMATICA: rinforza l'archetipo invece di duplicare la funzione. La carta migliore per QUESTO commander, anche se cambia totalmente ruolo.
+
+Rispondi con questo JSON:
+{
+  "cut_reason": "una frase italiano: perché tagliare questa carta in questo mazzo",
+  "alternatives": [
+    {"type":"powercreep","name":"Nome Carta","why":"max 15 parole italiano","est_price_eur":1.5},
+    {"type":"laterale","name":"Nome Carta","why":"max 15 parole italiano","est_price_eur":0.5},
+    {"type":"tematica","name":"Nome Carta","why":"max 15 parole italiano","est_price_eur":0.3}
+  ]
+}`;
+
+        try {
+          const text = await callClaude(apiKey, sys, usr, 800);
+          const parsed = extractJsonFromResponse(text);
+          results.push({
+            card: card.name,
+            cmc: card.cmc,
+            synergy: cand.synergy,
+            cut_reason: parsed.cut_reason || cand.synergy.reasoning,
+            alternatives: Array.isArray(parsed.alternatives) ? parsed.alternatives : [],
+          });
+        } catch (e) {
+          console.error(`Cut alternatives failed for ${card.name}:`, e);
+          results.push({
+            card: card.name,
+            cmc: card.cmc,
+            synergy: cand.synergy,
+            cut_reason: cand.synergy.reasoning,
+            alternatives: [],
+            error: e.message,
+          });
+        }
+        await new Promise(r => setTimeout(r, 150));
+      }
+      if (onProgress) onProgress(cutCandidates.length, cutCandidates.length);
+      return results;
+    }
+
+    // Recupera le top inclusions per il commander da EDHREC
+    async function fetchEdhrecTopCards(commanderName) {
+      try {
+        // EDHREC slug: lowercase, spazi → dash, no apostrofi/virgole
+        const slug = commanderName.toLowerCase()
+          .replace(/[',]/g, '')
+          .replace(/\s+/g, '-')
+          .replace(/[^a-z0-9-]/g, '');
+        const url = `https://json.edhrec.com/pages/commanders/${slug}.json`;
+        const res = await fetch(url);
+        if (!res.ok) {
+          console.warn('EDHREC fetch non ok:', res.status);
+          return [];
+        }
+        const json = await res.json();
+        const cards = [];
+        // Estrai dalle cardlists (varie sezioni: top cards, creatures, instants, ecc.)
+        const cardlists = json.container?.json_dict?.cardlists || [];
+        cardlists.forEach(list => {
+          (list.cardviews || []).forEach(cv => {
+            if (cv.name && !cards.find(c => c.name === cv.name)) {
+              cards.push({
+                name: cv.name,
+                synergy: cv.synergy || 0,
+                inclusion_pct: cv.inclusion ? cv.inclusion / cv.potential_decks : 0,
+                num_decks: cv.num_decks || 0,
+                tag: list.tag || '',
+              });
+            }
+          });
+        });
+        return cards;
+      } catch (e) {
+        console.warn('Errore EDHREC:', e);
+        return [];
+      }
+    }
+
+    // Filtra le top inclusions EDHREC con Claude per tenere solo le veramente sinergiche
+    async function filterAddsWithClaude(edhrecCards, currentDeckNames, commander, profile, archetype, apiKey, maxAdds = 8) {
+      if (edhrecCards.length === 0) return [];
+      const archetypeLabel = ARCHETYPES[archetype]?.label || archetype;
+      const inDeck = new Set(currentDeckNames.map(n => n.toLowerCase()));
+
+      // Pre-filtra: solo carte non già nel mazzo, top 30 per synergy EDHREC
+      const candidates = edhrecCards
+        .filter(c => !inDeck.has(c.name.toLowerCase()))
+        .sort((a, b) => (b.synergy || 0) - (a.synergy || 0))
+        .slice(0, 30);
+
+      if (candidates.length === 0) return [];
+
+      const sys = `Sei un esperto di Magic: The Gathering Commander. Filtri liste di carte popolari distinguendo quelle DAVVERO sinergiche da quelle solo popolari/goodstuff. Rispondi SOLO con JSON valido.`;
+
+      const list = candidates.map((c, i) => `${i+1}. ${c.name}`).join('\n');
+
+      const usr = `COMANDANTE: ${commander.name}
+PROFILO: ${JSON.stringify(profile).slice(0, 500)}
+ARCHETIPO: ${archetypeLabel}
+
+Carte popolari nelle liste EDHREC per questo commander:
+${list}
+
+Seleziona le ${maxAdds} carte che hanno VERA sinergia con questo commander+archetipo (non solo popolarità o goodstuff generico). Per ognuna, scrivi una motivazione di 12-15 parole in italiano e classifica per ruolo.
+
+Categorie possibili:
+- enabler = abilita la strategia del commander
+- amplifier = amplifica i payoff
+- protector = protegge commander/strategia
+- engine = motore di vantaggio coerente con l'archetipo
+- finisher = win condition
+
+Scarta carte solo popolari ma generiche per il commander.
+
+JSON:
+{
+  "adds": [
+    {"name":"...","category":"...","why":"...","priority":1-10}
+  ]
+}
+
+Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
+
+      try {
+        const text = await callClaude(apiKey, sys, usr, 1500);
+        const parsed = extractJsonFromResponse(text);
+        return Array.isArray(parsed.adds) ? parsed.adds : [];
+      } catch (e) {
+        console.error('Filter adds failed:', e);
+        return [];
+      }
+    }
+
+    // ============================================================
+    // COMPONENTI FASE 4 — Tab Cuts & Adds
+    // ============================================================
+
+    function AlternativeRow({ alt }) {
+      const typeLabel = {
+        powercreep: 'Powercreep',
+        laterale: 'Laterale',
+        tematica: 'Tematica',
+      };
+      const typeColor = {
+        powercreep: 'bg-red-900/30 text-red-300 border-red-700/30',
+        laterale: 'bg-blue-900/30 text-blue-300 border-blue-700/30',
+        tematica: 'bg-emerald-900/30 text-emerald-300 border-emerald-700/30',
+      };
+      const cls = typeColor[alt.type] || typeColor.laterale;
+      const label = typeLabel[alt.type] || alt.type;
+      const scryfallUrl = `https://scryfall.com/search?q=!"${encodeURIComponent(alt.name)}"`;
+      return (
+        <div className="flex items-start gap-3 py-2">
+          <span className={`${cls} border text-[10px] font-semibold uppercase px-2 py-0.5 rounded whitespace-nowrap`}>
+            {label}
+          </span>
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium text-zinc-200">
+              <a href={scryfallUrl} target="_blank" rel="noreferrer" className="hover:text-amber-400">
+                {alt.name}
+              </a>
+              {typeof alt.est_price_eur === 'number' && (
+                <span className="text-xs text-zinc-500 ml-2">~ {alt.est_price_eur.toFixed(2)}€</span>
+              )}
+            </div>
+            <div className="text-xs text-zinc-500">{alt.why}</div>
+          </div>
+        </div>
+      );
+    }
+
+    function CutCard({ cut }) {
+      const cardData = cut.cardData;
+      const scryfallUrl = `https://scryfall.com/search?q=!"${encodeURIComponent(cut.card)}"`;
+      return (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
+          <div className="p-4 border-b border-zinc-800">
+            <div className="flex items-start gap-3">
+              {cardData?.image_small && (
+                <img src={cardData.image_small} alt={cut.card} className="w-16 rounded border border-zinc-800 hidden sm:block" />
+              )}
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h4 className="font-semibold text-zinc-100">
+                    <a href={scryfallUrl} target="_blank" rel="noreferrer" className="hover:text-amber-400">
+                      {cut.card}
+                    </a>
+                  </h4>
+                  <span className="text-xs bg-red-900/40 text-red-300 border border-red-700/30 px-2 py-0.5 rounded">
+                    {cut.synergy.category}
+                  </span>
+                  <span className="text-xs text-zinc-500">sinergia {cut.synergy.score}/10</span>
+                </div>
+                <p className="text-sm text-zinc-400 mt-1.5">{cut.cut_reason}</p>
+              </div>
+            </div>
+          </div>
+          {cut.alternatives && cut.alternatives.length > 0 ? (
+            <div className="p-4 bg-zinc-950/40 divide-y divide-zinc-800/60">
+              {cut.alternatives.map((alt, i) => (
+                <AlternativeRow key={i} alt={alt} />
+              ))}
+            </div>
+          ) : (
+            <div className="p-4 text-xs text-zinc-500">
+              {cut.error ? `Alternative non generate: ${cut.error}` : 'Nessuna alternativa generata.'}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function AddCard({ add }) {
+      const catColors = {
+        enabler:   'bg-emerald-900/40 text-emerald-300 border-emerald-700/30',
+        amplifier: 'bg-emerald-900/40 text-emerald-300 border-emerald-700/30',
+        protector: 'bg-blue-900/40 text-blue-300 border-blue-700/30',
+        engine:    'bg-purple-900/40 text-purple-300 border-purple-700/30',
+        finisher:  'bg-amber-900/40 text-amber-300 border-amber-700/30',
+      };
+      const cls = catColors[add.category] || 'bg-zinc-800 text-zinc-300 border-zinc-700';
+      const scryfallUrl = `https://scryfall.com/search?q=!"${encodeURIComponent(add.name)}"`;
+      const priority = add.priority || 5;
+      return (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-3 flex items-center gap-3">
+          <div className="text-xs font-bold text-amber-400 w-8 text-center">{priority}</div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h4 className="text-sm font-medium">
+                <a href={scryfallUrl} target="_blank" rel="noreferrer" className="hover:text-amber-400">
+                  {add.name}
+                </a>
+              </h4>
+              <span className={`${cls} text-[10px] font-semibold border px-1.5 py-0.5 rounded uppercase`}>
+                {add.category}
+              </span>
+            </div>
+            <p className="text-xs text-zinc-500 mt-0.5">{add.why}</p>
+          </div>
+        </div>
+      );
+    }
+
+    function RecommendationsTab({ analysis, data, apiKey, onApiKeyMissing, synergies, recommendations, setRecommendations }) {
+      const [running, setRunning] = useState(false);
+      const [progress, setProgress] = useState({ current: 0, total: 0, phase: '' });
+      const [error, setError] = useState('');
+      const [view, setView] = useState('cuts');
+
+      const cacheKey = `recs_${data.commander?.name}_${data.archetype}`;
+
+      const handleRun = async () => {
+        if (!apiKey) { onApiKeyMissing(); return; }
+        if (!synergies) {
+          setError('Prima devi generare le sinergie nella tab "Sinergie".');
+          return;
+        }
+        setRunning(true);
+        setError('');
+        try {
+          // STEP 1: Cuts + alternatives
+          setProgress({ current: 0, total: 0, phase: 'Identifico le carte da tagliare...' });
+          const candidates = selectCutCandidates(synergies, analysis.all_cards, 8);
+          if (candidates.length === 0) {
+            setRecommendations({ cuts: [], adds: [], note: 'Nessun candidato evidente al taglio: il mazzo è ben sinergico.' });
+            setRunning(false);
+            return;
+          }
+
+          setProgress({ current: 0, total: candidates.length + 2, phase: 'Genero alternative per ogni cut...' });
+          const cuts = await generateAlternatives(
+            candidates,
+            data.commander,
+            synergies.profile,
+            data.archetype,
+            apiKey,
+            (curr, total) => setProgress({ current: curr, total: total + 2, phase: 'Genero alternative per ogni cut...' })
+          );
+
+          // Aggiungi cardData per immagini
+          cuts.forEach(c => {
+            const cd = analysis.all_cards.find(card => card.name === c.card);
+            if (cd) c.cardData = cd;
+          });
+
+          // STEP 2: Adds
+          setProgress({ current: candidates.length, total: candidates.length + 2, phase: 'Cerco candidati su EDHREC...' });
+          const edhrecCards = await fetchEdhrecTopCards(data.commander.name);
+
+          setProgress({ current: candidates.length + 1, total: candidates.length + 2, phase: 'Filtro le aggiunte con Claude...' });
+          const currentNames = analysis.all_cards.map(c => c.name);
+          const adds = await filterAddsWithClaude(
+            edhrecCards,
+            currentNames,
+            data.commander,
+            synergies.profile,
+            data.archetype,
+            apiKey,
+            8
+          );
+
+          const result = { cuts, adds, generatedAt: new Date().toISOString() };
+          setRecommendations(result);
+          saveToCache(cacheKey, result);
+          setRunning(false);
+        } catch (e) {
+          setError(e.message);
+          setRunning(false);
+        }
+      };
+
+      const handleClearCache = () => {
+        localStorage.removeItem(CACHE_PREFIX + cacheKey);
+        setRecommendations(null);
+      };
+
+      if (!synergies) {
+        return (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-8 text-center">
+            <h3 className="text-lg font-semibold mb-2">Servono prima le sinergie</h3>
+            <p className="text-sm text-zinc-400 max-w-md mx-auto mb-4">
+              Per generare i suggerimenti di taglio devo sapere quali carte sono in sinergia col commander e quali no.
+              Vai prima nella tab <strong className="text-zinc-200">Sinergie</strong> e premi "Analizza sinergie".
+            </p>
+          </div>
+        );
+      }
+
+      if (running) {
+        return (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-8 text-center">
+            <div className="inline-block w-10 h-10 border-4 border-amber-500/30 border-t-amber-500 rounded-full animate-spin mb-4"></div>
+            <div className="text-zinc-300 font-medium mb-1">{progress.phase}</div>
+            {progress.total > 0 && (
+              <div className="text-xs text-zinc-500">
+                Step {progress.current} di {progress.total}
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      if (!recommendations) {
+        return (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-8 text-center">
+            <h3 className="text-lg font-semibold mb-2">Suggerimenti cuts &amp; adds</h3>
+            <p className="text-sm text-zinc-400 mb-2 max-w-md mx-auto">
+              Identifico le 8 carte da tagliare con tre alternative classificate
+              (powercreep, laterale, tematica) e propongo 8 aggiunte filtrate da EDHREC
+              con vera sinergia per <strong className="text-zinc-200">{data.commander?.name}</strong>.
+            </p>
+            <p className="text-xs text-zinc-500 mb-6">
+              Tempo: ~30-60 secondi · Costo stimato: ~8-12 centesimi · Risultato salvato in cache locale
+            </p>
+            <button
+              onClick={handleRun}
+              className="bg-amber-500 hover:bg-amber-400 text-black font-semibold px-6 py-2.5 rounded-lg"
+            >
+              Genera raccomandazioni
+            </button>
+            {error && <div className="mt-4 text-sm text-red-400">{error}</div>}
+          </div>
+        );
+      }
+
+      // Risultati
+      if (recommendations.note) {
+        return (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-8 text-center">
+            <p className="text-zinc-300">{recommendations.note}</p>
+            <button onClick={handleClearCache} className="mt-4 text-xs text-zinc-500 hover:text-zinc-300">↻ Riprova</button>
+          </div>
+        );
+      }
+
+      return (
+        <div className="space-y-6">
+          {/* Toggle */}
+          <div className="flex items-center justify-between">
+            <div className="flex bg-zinc-900 border border-zinc-800 rounded-lg p-1">
+              <button
+                onClick={() => setView('cuts')}
+                className={`px-4 py-1.5 text-sm font-medium rounded ${view === 'cuts' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'}`}
+              >
+                Cuts ({recommendations.cuts?.length || 0})
+              </button>
+              <button
+                onClick={() => setView('adds')}
+                className={`px-4 py-1.5 text-sm font-medium rounded ${view === 'adds' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'}`}
+              >
+                Adds ({recommendations.adds?.length || 0})
+              </button>
+            </div>
+            <button onClick={handleClearCache} className="text-xs text-zinc-500 hover:text-zinc-300">↻ Rigenera</button>
+          </div>
+
+          {/* CUTS */}
+          {view === 'cuts' && (
+            <div className="space-y-3">
+              {(!recommendations.cuts || recommendations.cuts.length === 0) ? (
+                <p className="text-sm text-zinc-500 text-center py-8">Nessun cut suggerito.</p>
+              ) : (
+                <>
+                  <div className="text-xs text-zinc-500 px-1">
+                    Carte ordinate per priorità di taglio. Per ognuna, tre alternative:
+                    <span className="text-red-400 ml-2">powercreep</span> (più potente),
+                    <span className="text-blue-400 ml-2">laterale</span> (sapore diverso),
+                    <span className="text-emerald-400 ml-2">tematica</span> (rinforza l'archetipo).
+                  </div>
+                  {recommendations.cuts.map((cut, i) => (
+                    <CutCard key={i} cut={cut} />
+                  ))}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* ADDS */}
+          {view === 'adds' && (
+            <div className="space-y-3">
+              {(!recommendations.adds || recommendations.adds.length === 0) ? (
+                <div className="text-sm text-zinc-500 text-center py-8">
+                  Nessuna aggiunta suggerita. EDHREC potrebbe non avere dati per questo commander, o tutte le sue top inclusions sono già nel mazzo.
+                </div>
+              ) : (
+                <>
+                  <div className="text-xs text-zinc-500 px-1">
+                    Carte non presenti nel mazzo, filtrate per vera sinergia con il commander (non solo popolarità).
+                    Numero a sinistra = priorità (1-10), più alto = più impattante.
+                  </div>
+                  {recommendations.adds.map((add, i) => (
+                    <AddCard key={i} add={add} />
+                  ))}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============================================================
     // FUNCTION TAGGING
     // analizza il testo della carta e applica tag funzionali
     // ============================================================
@@ -1888,7 +2379,7 @@ ${cardList}`;
       );
     }
 
-    function ResultsView({ data, analysis, scores, onReset, apiKey, onApiKeyMissing, synergies, setSynergies }) {
+    function ResultsView({ data, analysis, scores, onReset, apiKey, onApiKeyMissing, synergies, setSynergies, recommendations, setRecommendations }) {
       const [tab, setTab] = useState('overview');
       const dimNames = {
         mana_base: 'Mana base',
@@ -1959,6 +2450,16 @@ ${cardList}`;
               }`}
             >
               Bracket
+            </button>
+            <button
+              onClick={() => setTab('recs')}
+              className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px flex items-center gap-2 ${
+                tab === 'recs'
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              Cuts &amp; Adds {recommendations && <span className="text-emerald-400 text-xs">●</span>}
             </button>
           </div>
 
@@ -2103,6 +2604,18 @@ ${cardList}`;
 
           {tab === 'bracket' && (
             <BracketTab analysis={analysis} data={data} />
+          )}
+
+          {tab === 'recs' && (
+            <RecommendationsTab
+              analysis={analysis}
+              data={data}
+              apiKey={apiKey}
+              onApiKeyMissing={onApiKeyMissing}
+              synergies={synergies}
+              recommendations={recommendations}
+              setRecommendations={setRecommendations}
+            />
           )}
         </div>
       );
@@ -2272,14 +2785,24 @@ ${cardList}`;
       const [apiKey, setApiKeyState] = useState(getApiKey());
       const [showApiKeyModal, setShowApiKeyModal] = useState(false);
       const [synergies, setSynergies] = useState(null);
+      const [recommendations, setRecommendations] = useState(null);
 
-      // Quando arriviamo alla schermata risultati, prova a caricare le sinergie dalla cache
+      // Quando arriviamo alla schermata risultati, prova a caricare le sinergie e raccomandazioni dalla cache
       useEffect(() => {
         if (phase === 'results' && data?.commander) {
-          const cacheKey = `synergies_${data.commander.name}_${data.archetype}`;
-          const cached = loadFromCache(cacheKey);
-          if (cached) setSynergies(cached);
-          else setSynergies(null);
+          const synKey = `synergies_${data.commander.name}_${data.archetype}`;
+          const recKey = `recs_${data.commander.name}_${data.archetype}`;
+          const cachedSyn = loadFromCache(synKey);
+          const cachedRec = loadFromCache(recKey);
+          setSynergies(cachedSyn || null);
+          setRecommendations(cachedRec || null);
+          // Re-popola cardData per immagini in cuts
+          if (cachedRec?.cuts && data.cards) {
+            cachedRec.cuts.forEach(c => {
+              const cd = data.cards.find(card => card.name === c.card);
+              if (cd) c.cardData = cd;
+            });
+          }
         }
       }, [phase, data]);
 
@@ -2355,6 +2878,7 @@ ${cardList}`;
         setAnalysis(null);
         setScores(null);
         setSynergies(null);
+        setRecommendations(null);
         setError('');
       };
 
@@ -2389,6 +2913,8 @@ ${cardList}`;
                 onApiKeyMissing={() => setShowApiKeyModal(true)}
                 synergies={synergies}
                 setSynergies={setSynergies}
+                recommendations={recommendations}
+                setRecommendations={setRecommendations}
               />
             )}
             {phase === 'error' && <ErrorScreen error={error} onBack={handleReset} />}
@@ -2401,7 +2927,7 @@ ${cardList}`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.3 · Synergy + Bracket · Scryfall + Claude + Spellbook · Prezzi via Cardmarket
+            v0.4 · Synergy + Bracket + Recommendations · Scryfall + Claude + Spellbook + EDHREC · Prezzi via Cardmarket
           </footer>
         </div>
       );
