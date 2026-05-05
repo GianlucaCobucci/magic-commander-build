@@ -32,7 +32,7 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
   <script type="text/babel" data-presets="env,react">
-    const { useState, useMemo, useEffect } = React;
+    const { useState, useMemo, useEffect, useRef } = React;
     const {
       RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
       Radar, ResponsiveContainer, Legend, Tooltip,
@@ -643,7 +643,14 @@ JSON:
           <div className={`text-lg font-bold w-10 text-right ${scoreColor}`}>{score}</div>
           <div className="flex-1 min-w-0">
             <div className="text-sm font-medium truncate">
-              <a href={card.scryfall_uri} target="_blank" rel="noreferrer" className="hover:text-amber-400">{card.name}</a>
+              <CardImageHover
+                name={card.name}
+                imageUrl={card.image}
+                scryfallUri={card.scryfall_uri}
+                className="hover:text-amber-400"
+              >
+                {card.name}
+              </CardImageHover>
             </div>
             <div className="text-xs text-zinc-500 truncate" title={why}>{why}</div>
           </div>
@@ -689,22 +696,18 @@ JSON:
           <div className="ml-13 mt-2 flex flex-wrap gap-1">
             {(pkg.cards || []).map((cardName, i) => {
               const isKey = keyPiecesSet.has(cardName.toLowerCase());
-              const scryfallUrl = `https://scryfall.com/search?q=!"${encodeURIComponent(cardName)}"`;
               return (
-                <a
+                <CardImageHover
                   key={i}
-                  href={scryfallUrl}
-                  target="_blank"
-                  rel="noreferrer"
+                  name={cardName}
                   className={`text-xs px-2 py-1 rounded border ${
                     isKey
                       ? 'bg-amber-950/40 border-amber-700/50 text-amber-200 font-medium'
                       : 'bg-zinc-900 border-zinc-700 text-zinc-300 hover:bg-zinc-800'
                   }`}
-                  title={isKey ? 'Pezzo chiave del pacchetto' : 'Carta del pacchetto'}
                 >
                   {isKey && '★ '}{cardName}
-                </a>
+                </CardImageHover>
               );
             })}
           </div>
@@ -939,88 +942,86 @@ JSON:
     // FASE 3 — Bracket Assessment + Combo Detection
     // ============================================================
 
-    // Game Changers list ufficiale WotC (snapshot)
-    // Fonte: https://magic.wizards.com/en/news/announcements/introducing-commander-brackets-beta
-    // Lista da aggiornare manualmente quando WotC rilascia nuove revisioni.
-    const GAME_CHANGERS = new Set([
-      // Mass Land Denial enabler / fast mana
-      "Ancient Tomb",
-      "Chrome Mox",
-      "Mana Vault",
-      "Mox Diamond",
-      "Mishra's Workshop",
-      "The One Ring",
-      "Trinisphere",
-      // Combo enabler / lock pieces
-      "Aetherflux Reservoir",
-      "Bolas's Citadel",
-      "Coalition Victory",
-      "Demonic Tutor",
-      "Dockside Extortionist",
-      "Drannith Magistrate",
-      "Enlightened Tutor",
-      "Field of the Dead",
-      "Fierce Guardianship",
-      "Force of Will",
-      "Gaea's Cradle",
-      "Glacial Chasm",
-      "Grand Arbiter Augustin IV",
-      "Grim Monolith",
-      "Humility",
-      "Imperial Seal",
-      "Intuition",
-      "Jeska's Will",
-      "Jin-Gitaxias, Core Augur",
-      "Kinnan, Bonder Prodigy",
-      "Lion's Eye Diamond",
-      "Mana Drain",
-      "Mox Vault",
-      "Mystical Tutor",
-      "Natural Order",
-      "Necropotence",
-      "Notion Thief",
-      "Opposition Agent",
-      "Orcish Bowmasters",
-      "Panoptic Mirror",
-      "Rhystic Study",
-      "Seedborn Muse",
-      "Serra's Sanctum",
-      "Smothering Tithe",
-      "Survival of the Fittest",
-      "Sway of the Stars",
-      "Tergrid, God of Fright",
-      "Thassa's Oracle",
-      "The Tabernacle at Pendrell Vale",
-      "Thoracle",
-      "Trinket Mage",
-      "True-Name Nemesis",
-      "Underworld Breach",
-      "Urza, Lord High Artificer",
-      "Vampiric Tutor",
-      "Vorinclex, Voice of Hunger",
-      "Winota, Joiner of Forces",
-      "Yuriko, the Tiger's Shadow",
-      // Tutori free / instant
-      "Worldly Tutor",
-      "Vampiric Tutor",
-      "Mystical Tutor",
-      "Enlightened Tutor",
-      // Stax pieces aggressivi
-      "Stasis",
-      "Winter Orb",
-      "Static Orb",
-      "Tangle Wire",
-      "Armageddon",
-      "Ravages of War",
-      "Cataclysm",
-      // Extra turn loop enabler
-      "Time Warp",
-      "Temporal Manipulation",
-      "Capture of Jingzhou",
-      "Walk the Aeons",
-      "Nexus of Fate",
-      "Beacon of Tomorrows",
+    // Game Changers list — fetchata da Scryfall via "is:gamechanger".
+    // È la lista canonica WotC, aggiornata automaticamente.
+    // Fallback hard-coded solo se Scryfall non risponde.
+    const GAME_CHANGERS_FALLBACK = new Set([
+      "Ancient Tomb", "Bolas's Citadel", "Chrome Mox", "Coalition Victory",
+      "Demonic Tutor", "Drannith Magistrate", "Enlightened Tutor",
+      "Field of the Dead", "Fierce Guardianship", "Force of Will",
+      "Gaea's Cradle", "Glacial Chasm", "Grand Arbiter Augustin IV",
+      "Grim Monolith", "Humility", "Imperial Seal", "Intuition",
+      "Jeska's Will", "Jin-Gitaxias, Core Augur", "Kinnan, Bonder Prodigy",
+      "Lion's Eye Diamond", "Mana Drain", "Mana Vault", "Mishra's Workshop",
+      "Mox Diamond", "Mystical Tutor", "Natural Order", "Necropotence",
+      "Notion Thief", "Opposition Agent", "Orcish Bowmasters", "Panoptic Mirror",
+      "Rhystic Study", "Seedborn Muse", "Serra's Sanctum", "Smothering Tithe",
+      "Survival of the Fittest", "Sway of the Stars", "Tergrid, God of Fright",
+      "Thassa's Oracle", "The One Ring", "The Tabernacle at Pendrell Vale",
+      "Trinisphere", "True-Name Nemesis", "Underworld Breach",
+      "Urza, Lord High Artificer", "Vampiric Tutor", "Vorinclex, Voice of Hunger",
+      "Winota, Joiner of Forces", "Yuriko, the Tiger's Shadow",
     ]);
+
+    // Cache in-memory per la lista live
+    let __gameChangersCache = null;
+
+    // Recupera la lista Game Changers da Scryfall (con cache 24h in localStorage)
+    async function fetchGameChangersList() {
+      // Cache in-memory per la sessione
+      if (__gameChangersCache) return __gameChangersCache;
+
+      // Cache 24h in localStorage
+      const CACHE_KEY = 'mtg_eval_gamechangers_v2';
+      try {
+        const cached = localStorage.getItem(CACHE_KEY);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          const ageHours = (Date.now() - parsed.timestamp) / (1000 * 60 * 60);
+          if (ageHours < 24 && Array.isArray(parsed.cards)) {
+            __gameChangersCache = new Set(parsed.cards);
+            return __gameChangersCache;
+          }
+        }
+      } catch {}
+
+      // Fetch da Scryfall
+      try {
+        const allCards = [];
+        let url = 'https://api.scryfall.com/cards/search?q=is%3Agamechanger&unique=cards';
+        let safety = 10; // max 10 pagine, per sicurezza
+        while (url && safety-- > 0) {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error(`Scryfall ${res.status}`);
+          const json = await res.json();
+          (json.data || []).forEach(c => allCards.push(c.name));
+          url = json.has_more ? json.next_page : null;
+          if (url) await new Promise(r => setTimeout(r, 100));
+        }
+        if (allCards.length > 0) {
+          __gameChangersCache = new Set(allCards);
+          try {
+            localStorage.setItem(CACHE_KEY, JSON.stringify({
+              timestamp: Date.now(),
+              cards: allCards,
+            }));
+          } catch {}
+          return __gameChangersCache;
+        }
+      } catch (e) {
+        console.warn('Fetch Game Changers da Scryfall fallito, uso fallback:', e);
+      }
+
+      // Fallback alla lista hard-coded
+      __gameChangersCache = GAME_CHANGERS_FALLBACK;
+      return __gameChangersCache;
+    }
+
+    // Helper sincrono: usa la cache attuale (se non c'è, fallback)
+    function isGameChanger(cardName) {
+      const list = __gameChangersCache || GAME_CHANGERS_FALLBACK;
+      return list.has(cardName);
+    }
 
     // Carte considerate Mass Land Destruction (o effetti equivalenti)
     const MLD_NAMES_EXTRA = new Set([
@@ -1042,7 +1043,7 @@ JSON:
       };
 
       cards.forEach(c => {
-        if (GAME_CHANGERS.has(c.name)) factors.gameChangers.push(c.name);
+        if (isGameChanger(c.name)) factors.gameChangers.push(c.name);
         if (c.tags?.includes('mld') || MLD_NAMES_EXTRA.has(c.name)) {
           if (!factors.mld.includes(c.name)) factors.mld.push(c.name);
         }
@@ -1842,6 +1843,25 @@ Win conditions: ${(data.autoDetected.win_conditions || []).join('; ')}.`,
         });
       }
 
+      // === STAPLE OBBLIGATORIE: forzate sempre nella whitelist ===
+      // Sia in fromScratch che in optimize, le staple per CI+bracket sono obbligatorie
+      const obligatoryStaples = getStaplesForDeck(colorIdentity, bracketTarget);
+      const alreadyInWl = new Set(whitelistKeep.map(w => w.name.toLowerCase()));
+      obligatoryStaples.forEach(stapleName => {
+        // Rimuovi dalla blacklist se per errore una staple ci finisce
+        blacklistExclude.delete(stapleName);
+        // Aggiungi alla whitelist se non c'è già
+        if (!alreadyInWl.has(stapleName.toLowerCase())) {
+          whitelistKeep.push({
+            name: stapleName,
+            category: 'staple',
+            score: 10,
+            source: 'staple',
+          });
+        }
+      });
+      whitelistKeep.sort((a, b) => b.score - a.score);
+
       // === PASSAGGIO 1: Pool dal Scryfall (per validare lands) ===
       if (onProgress) onProgress({ phase: 'Recupero info delle carte del pool...', step: 2, total: 6 });
 
@@ -2617,7 +2637,13 @@ Rispondi con JSON ESATTO:
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <h5 className="text-sm font-medium">
-                  <a href={scryfallUrl} target="_blank" rel="noreferrer" className="hover:text-amber-400">{card.name}</a>
+                  <CardImageHover
+                    name={card.name}
+                    imageUrl={card.card_data?.image}
+                    className="hover:text-amber-400"
+                  >
+                    {card.name}
+                  </CardImageHover>
                 </h5>
                 <span className={`${cls} text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase`}>
                   {card.category}
@@ -3083,24 +3109,139 @@ ${invalidCards.map(c => `# - ${c.name}`).join('\n')}` : ''}`}
     }
 
     // ============================================================
+    // STAPLE OBBLIGATORIE per color identity e bracket
+    // Carte che NON vanno nei cuts e che il generatore deve sempre includere
+    // (salvo eccezioni per cEDH bracket 5 dove cambia la lista).
+    // ============================================================
+
+    // Struttura: { 'always': [...], 'W': [...], 'U': [...], ... }
+    // 'always' = sempre obbligatorie indipendentemente dai colori
+    // Lettere singole = solo se quel colore è nella color identity
+    // 'multicolor_2plus' = se il commander ha 2+ colori
+    const ESSENTIAL_STAPLES = {
+      // Sempre obbligatorie (escludendo cEDH bracket 5)
+      always: [
+        'Sol Ring',
+        'Command Tower',
+        'Arcane Signet',
+      ],
+      // Bianco
+      W: [
+        'Swords to Plowshares',
+        'Path to Exile',
+        'Generous Gift',
+      ],
+      // Blu
+      U: [
+        'Counterspell',
+        'Swan Song',
+        'Negate',
+        'Cyclonic Rift',
+      ],
+      // Nero
+      B: [
+        'Toxic Deluge',
+        'Demonic Tutor', // bracket 4+ only, gestito sotto
+      ],
+      // Rosso
+      R: [
+        'Vandalblast',
+        'Chaos Warp',
+      ],
+      // Verde
+      G: [
+        'Cultivate',
+        'Three Visits',
+        "Nature's Lore",
+        'Beast Within',
+      ],
+      // Multicolor (2+ colori)
+      multicolor_2plus: [
+        'Anguished Unmaking', // BW
+        "Assassin's Trophy", // BG
+        'Smothering Tithe', // W, bracket 3+
+      ],
+    };
+
+    // Carte che sono staple SOLO da bracket X in su
+    const STAPLES_BY_MIN_BRACKET = {
+      'Demonic Tutor': 4,
+      'Smothering Tithe': 3,
+      "Dockside Extortionist": 4,
+      'Wheel of Fortune': 4,
+    };
+
+    // Per cEDH bracket 5: alcune staple "lente" non sono più obbligatorie
+    // perché esistono versioni più veloci che il generatore dovrebbe scegliere
+    const STAPLES_DROPPED_AT_CEDH = new Set([
+      'Cultivate', // troppo lento, in cEDH usi Three Visits o niente
+    ]);
+
+    // Restituisce il set di carte staple obbligatorie per un mazzo
+    function getStaplesForDeck(colorIdentity, bracket) {
+      const ci = (colorIdentity || '').toUpperCase();
+      const colors = ci.split('').filter(c => 'WUBRG'.includes(c));
+      const staples = new Set();
+
+      // Aggiungi 'always'
+      ESSENTIAL_STAPLES.always.forEach(name => staples.add(name));
+
+      // Aggiungi le staple per ogni colore presente
+      colors.forEach(color => {
+        (ESSENTIAL_STAPLES[color] || []).forEach(name => staples.add(name));
+      });
+
+      // Aggiungi staple multicolor se ≥ 2 colori
+      if (colors.length >= 2) {
+        ESSENTIAL_STAPLES.multicolor_2plus.forEach(name => staples.add(name));
+      }
+
+      // Filtra le staple che hanno un bracket minimo non raggiunto
+      Object.entries(STAPLES_BY_MIN_BRACKET).forEach(([name, minBracket]) => {
+        if (bracket < minBracket) staples.delete(name);
+      });
+
+      // Per cEDH bracket 5, droppa quelle troppo lente
+      if (bracket >= 5) {
+        STAPLES_DROPPED_AT_CEDH.forEach(name => staples.delete(name));
+      }
+
+      return staples;
+    }
+
+    // Verifica se una carta specifica è staple obbligatoria per un mazzo
+    function isObligatoryStaple(cardName, colorIdentity, bracket) {
+      return getStaplesForDeck(colorIdentity, bracket).has(cardName);
+    }
+
+    // ============================================================
     // FASE 4 — Recommendations: Cuts & Adds
     // ============================================================
 
     // Seleziona i candidati al taglio dalle sinergie
-    function selectCutCandidates(synergies, cards, maxCuts = 8) {
+    function selectCutCandidates(synergies, cards, maxCuts = 12, colorIdentity = '', bracket = 3) {
       if (!synergies?.scores) return [];
 
       // Costruisci il set di carte protette dai pacchetti tematici
       const protectedByPackages = getPackageProtectedCards(synergies.packages || []);
+      // Set delle staple obbligatorie
+      const obligatoryStaples = getStaplesForDeck(colorIdentity, bracket);
 
       const candidates = [];
       const skippedByProtection = [];
+      const skippedByStaple = [];
 
       cards.forEach(c => {
         if (c.isCommander) return;
-        if (c.tags?.includes('land')) return; // i lands non li tagliamo da qui
+        if (c.tags?.includes('land')) return;
         const syn = synergies.scores[c.name];
         if (!syn) return;
+
+        // Se è una staple obbligatoria, non candidiamo al taglio MAI
+        if (obligatoryStaples.has(c.name)) {
+          skippedByStaple.push({ name: c.name, category: syn.category, score: syn.score });
+          return;
+        }
 
         // Se la carta è protetta da un pacchetto importante, non la candidiamo al taglio
         if (protectedByPackages.has(c.name.toLowerCase())) {
@@ -3114,13 +3255,13 @@ ${invalidCards.map(c => `# - ${c.name}`).join('\n')}` : ''}`}
         else if (syn.category === 'redundant') priority = 80 - syn.score;
         else if (syn.category === 'utility_generic' && syn.score <= 5) priority = 60 - syn.score;
         else if (syn.score <= 3) priority = 50 - syn.score;
-        else return; // non candidato
+        else return;
         candidates.push({ card: c, synergy: syn, priority });
       });
       candidates.sort((a, b) => b.priority - a.priority);
       const result = candidates.slice(0, maxCuts);
-      // Attacchiamo info sulle carte protette per debug/UI
       result.protectedSkipped = skippedByProtection;
+      result.stapleSkipped = skippedByStaple;
       return result;
     }
 
@@ -3374,7 +3515,7 @@ Esempio per un Voja tribal Lupi/Umani Selesnya:
       const candidates = edhrecCards
         .filter(c => !inDeck.has(c.name.toLowerCase()))
         .sort((a, b) => (b.synergy || 0) - (a.synergy || 0))
-        .slice(0, 30);
+        .slice(0, 40);
 
       if (candidates.length === 0) return [];
 
@@ -3386,10 +3527,10 @@ Esempio per un Voja tribal Lupi/Umani Selesnya:
 PROFILO: ${JSON.stringify(profile).slice(0, 500)}
 STRATEGIA: ${archetypeFullContext}
 
-Carte popolari nelle liste EDHREC per questo commander:
+Carte popolari nelle liste EDHREC per questo commander (${candidates.length} candidate):
 ${list}
 
-Seleziona le ${maxAdds} carte che hanno VERA sinergia con questo commander+archetipo (non solo popolarità o goodstuff generico). Per ognuna, scrivi una motivazione di 12-15 parole in italiano e classifica per ruolo.
+Seleziona ESATTAMENTE ${maxAdds} carte (più scelte = più opzioni per l'utente) che hanno VERA sinergia con questo commander+archetipo (non solo popolarità o goodstuff generico). Per ognuna, scrivi una motivazione di 12-15 parole in italiano e classifica per ruolo. Mescola scelte ovvie con scelte meno standard ma valide.
 
 Categorie possibili:
 - enabler = abilita la strategia del commander
@@ -3444,9 +3585,9 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           </span>
           <div className="flex-1 min-w-0">
             <div className="text-sm font-medium text-zinc-200">
-              <a href={scryfallUrl} target="_blank" rel="noreferrer" className="hover:text-amber-400">
+              <CardImageHover name={alt.name} className="hover:text-amber-400">
                 {alt.name}
-              </a>
+              </CardImageHover>
               {typeof alt.est_price_eur === 'number' && (
                 <span className="text-xs text-zinc-500 ml-2">~ {alt.est_price_eur.toFixed(2)}€</span>
               )}
@@ -3459,7 +3600,6 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
 
     function CutCard({ cut }) {
       const cardData = cut.cardData;
-      const scryfallUrl = `https://scryfall.com/search?q=!"${encodeURIComponent(cut.card)}"`;
       return (
         <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
           <div className="p-4 border-b border-zinc-800">
@@ -3470,9 +3610,13 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   <h4 className="font-semibold text-zinc-100">
-                    <a href={scryfallUrl} target="_blank" rel="noreferrer" className="hover:text-amber-400">
+                    <CardImageHover
+                      name={cut.card}
+                      imageUrl={cardData?.image}
+                      className="hover:text-amber-400"
+                    >
                       {cut.card}
-                    </a>
+                    </CardImageHover>
                   </h4>
                   <span className="text-xs bg-red-900/40 text-red-300 border border-red-700/30 px-2 py-0.5 rounded">
                     {cut.synergy.category}
@@ -3507,7 +3651,6 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
         finisher:  'bg-amber-900/40 text-amber-300 border-amber-700/30',
       };
       const cls = catColors[add.category] || 'bg-zinc-800 text-zinc-300 border-zinc-700';
-      const scryfallUrl = `https://scryfall.com/search?q=!"${encodeURIComponent(add.name)}"`;
       const priority = add.priority || 5;
       return (
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-3 flex items-center gap-3">
@@ -3515,9 +3658,9 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
               <h4 className="text-sm font-medium">
-                <a href={scryfallUrl} target="_blank" rel="noreferrer" className="hover:text-amber-400">
+                <CardImageHover name={add.name} className="hover:text-amber-400">
                   {add.name}
-                </a>
+                </CardImageHover>
               </h4>
               <span className={`${cls} text-[10px] font-semibold border px-1.5 py-0.5 rounded uppercase`}>
                 {add.category}
@@ -3551,7 +3694,8 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
         try {
           // STEP 1: Cuts + alternatives
           setProgress({ current: 0, total: 0, phase: 'Identifico le carte da tagliare...' });
-          const candidates = selectCutCandidates(synergies, analysis.all_cards, 8);
+          const ci = (data.commander.color_identity || []).join('') || 'C';
+          const candidates = selectCutCandidates(synergies, analysis.all_cards, 12, ci, data.bracketTarget);
           if (candidates.length === 0) {
             setRecommendations({ cuts: [], adds: [], note: 'Nessun candidato evidente al taglio: il mazzo è ben sinergico.' });
             setRunning(false);
@@ -3589,7 +3733,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
             synergies.profile,
             data.archetype,
             apiKey,
-            8,
+            12,
             archetypeContext
           );
 
@@ -3597,6 +3741,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
             cuts,
             adds,
             protected_skipped: candidates.protectedSkipped || [],
+            staple_skipped: candidates.stapleSkipped || [],
             generatedAt: new Date().toISOString(),
           };
           setRecommendations(result);
@@ -3706,6 +3851,23 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
                     <span className="text-blue-400 ml-2">laterale</span> (sapore diverso),
                     <span className="text-emerald-400 ml-2">tematica</span> (rinforza l'archetipo).
                   </div>
+                  {recommendations.staple_skipped && recommendations.staple_skipped.length > 0 && (
+                    <details className="bg-zinc-950 border border-zinc-800 rounded-lg p-3">
+                      <summary className="cursor-pointer text-xs text-emerald-300 font-medium">
+                        ⭐ {recommendations.staple_skipped.length} staple obbligatorie tenute (Sol Ring, removal di base, ecc.)
+                      </summary>
+                      <div className="mt-2 text-xs text-zinc-400">
+                        Queste sono staple essenziali per il bracket e i colori del mazzo, escluse dai tagli automatici:
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {recommendations.staple_skipped.map((p, i) => (
+                          <span key={i} className="text-[11px] bg-emerald-950/30 border border-emerald-700/30 text-emerald-200 px-2 py-0.5 rounded">
+                            {p.name}
+                          </span>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                   {recommendations.protected_skipped && recommendations.protected_skipped.length > 0 && (
                     <details className="bg-zinc-950 border border-zinc-800 rounded-lg p-3">
                       <summary className="cursor-pointer text-xs text-amber-300 font-medium">
@@ -4467,6 +4629,91 @@ ${cardData}`;
     // ============================================================
     // COMPONENTI UI
     // ============================================================
+
+    // Componente riusabile: nome carta + anteprima immagine al passaggio del mouse.
+    // Usa un fetch lazy a Scryfall per ottenere l'immagine se non è fornita esplicitamente.
+    const __cardImageCache = new Map();
+
+    async function fetchCardImage(name) {
+      const key = name.toLowerCase();
+      if (__cardImageCache.has(key)) return __cardImageCache.get(key);
+      try {
+        const url = `https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(name)}`;
+        const res = await fetch(url);
+        if (!res.ok) {
+          __cardImageCache.set(key, null);
+          return null;
+        }
+        const json = await res.json();
+        // Cerca image_uris (single face) o card_faces[0].image_uris (DFC)
+        let img = json.image_uris?.normal || json.image_uris?.large;
+        if (!img && json.card_faces && json.card_faces[0]?.image_uris) {
+          img = json.card_faces[0].image_uris.normal || json.card_faces[0].image_uris.large;
+        }
+        __cardImageCache.set(key, img || null);
+        return img || null;
+      } catch (e) {
+        __cardImageCache.set(key, null);
+        return null;
+      }
+    }
+
+    function CardImageHover({ name, imageUrl, scryfallUri, className = '', children }) {
+      const [showImage, setShowImage] = useState(false);
+      const [resolvedImage, setResolvedImage] = useState(imageUrl || null);
+      const [position, setPosition] = useState({ x: 0, y: 0 });
+      const hoverTimeoutRef = useRef(null);
+
+      const handleMouseEnter = (e) => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        setPosition({ x: rect.right + 8, y: rect.top });
+        // Delay ~200ms per evitare flicker quando si passa veloce
+        hoverTimeoutRef.current = setTimeout(async () => {
+          setShowImage(true);
+          if (!resolvedImage && name) {
+            const img = await fetchCardImage(name);
+            if (img) setResolvedImage(img);
+          }
+        }, 200);
+      };
+
+      const handleMouseLeave = () => {
+        if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+        setShowImage(false);
+      };
+
+      const linkUrl = scryfallUri || `https://scryfall.com/search?q=!"${encodeURIComponent(name)}"`;
+
+      return (
+        <>
+          <a
+            href={linkUrl}
+            target="_blank"
+            rel="noreferrer"
+            className={className}
+            onMouseEnter={handleMouseEnter}
+            onMouseLeave={handleMouseLeave}
+          >
+            {children || name}
+          </a>
+          {showImage && resolvedImage && (
+            <div
+              className="fixed pointer-events-none z-50"
+              style={{
+                left: Math.min(position.x, window.innerWidth - 240),
+                top: Math.max(8, Math.min(position.y, window.innerHeight - 340)),
+              }}
+            >
+              <img
+                src={resolvedImage}
+                alt={name}
+                className="w-56 rounded-lg border-2 border-zinc-700 shadow-2xl"
+              />
+            </div>
+          )}
+        </>
+      );
+    }
 
     function ManaCost({ cost }) {
       if (!cost) return null;
@@ -5381,7 +5628,14 @@ ${cardData}`;
                   <tr key={i} className="border-b border-zinc-800/60 hover:bg-zinc-800/30">
                     <td className="py-2 pr-2 font-medium">
                       {c.isCommander && <span className="text-amber-400 mr-1">★</span>}
-                      <a href={c.scryfall_uri} target="_blank" rel="noreferrer" className="hover:text-amber-400">{c.name}</a>
+                      <CardImageHover
+                        name={c.name}
+                        imageUrl={c.image}
+                        scryfallUri={c.scryfall_uri}
+                        className="hover:text-amber-400"
+                      >
+                        {c.name}
+                      </CardImageHover>
                       {c.tags_refined_by_ai && (
                         <span className="ml-1.5 text-emerald-400 text-[10px]" title="Tag identificati da Claude">✨</span>
                       )}
@@ -5442,6 +5696,11 @@ ${cardData}`;
       const [synergies, setSynergies] = useState(null);
       const [recommendations, setRecommendations] = useState(null);
       const [generated, setGenerated] = useState(null);
+
+      // Fetch lista Game Changers da Scryfall all'avvio (in background, non blocca)
+      useEffect(() => {
+        fetchGameChangersList().catch(e => console.warn('GC fetch fallito:', e));
+      }, []);
 
       // Cache key che incorpora la modalità archetipo
       function buildCacheKey(prefix, d) {
@@ -5688,7 +5947,7 @@ ${cardData}`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.13 · Bug fixes (cambio commander, decklist pulita, bracket check)
+            v0.14 · Game Changers da Scryfall · Staple obbligatorie · Anteprima carta · Cuts/Adds 12
           </footer>
         </div>
       );
