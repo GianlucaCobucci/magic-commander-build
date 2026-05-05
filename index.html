@@ -2107,6 +2107,25 @@ JSON:
       // Total count
       if (cards.length !== 99) warnings.push(`Lista ha ${cards.length} carte invece di 99.`);
 
+      // Verifica coerenza con il bracket dichiarato
+      // Costruisco un array "carte stile interno" con tag inferiti per riusare detectBracketFactors
+      const cardsForBracket = cards.map(c => {
+        const sc = c.card_data || {};
+        return {
+          ...c,
+          tags: sc.tags || [],
+          name: c.name,
+        };
+      });
+      const bracketFactors = detectBracketFactors(cardsForBracket);
+      const bracketResult = estimateBracket(bracketFactors, [], data?.archetype || 'midrange');
+      const estimatedBracket = bracketResult.bracket;
+      if (estimatedBracket > bracketTarget) {
+        warnings.push(`Il mazzo generato è più potente del bracket dichiarato: stimato bracket ${estimatedBracket}, target ${bracketTarget}. Driver: ${bracketResult.drivers.slice(0, 2).join('; ')}.`);
+      } else if (estimatedBracket < bracketTarget && bracketTarget >= 3) {
+        warnings.push(`Il mazzo generato è più debole del bracket dichiarato: stimato bracket ${estimatedBracket}, target ${bracketTarget}. Considera carte più potenti per il bracket richiesto.`);
+      }
+
       // Generate construction logic explanation
       const constructionLogic = buildConstructionLogic({
         mode,
@@ -2707,13 +2726,22 @@ Rispondi con JSON ESATTO:
       const handleCopyDecklist = () => {
         if (!generated) return;
         const lines = [`1 ${generated.commander_name}`];
-        // raggruppa per category in ordine logico
+        const skipped = [];
         generated.cards.forEach(c => {
-          lines.push(`1 ${c.name}`);
+          if (c.found === false) {
+            skipped.push(c.name);
+          } else {
+            lines.push(`1 ${c.name}`);
+          }
         });
-        navigator.clipboard.writeText(lines.join('\n'));
+        let text = lines.join('\n');
+        if (skipped.length > 0) {
+          text += `\n\n# ${skipped.length} carte escluse perché non verificate su Scryfall:\n`;
+          skipped.forEach(n => { text += `# - ${n}\n`; });
+        }
+        navigator.clipboard.writeText(text);
         setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
+        setTimeout(() => setCopied(false), 2500);
       };
 
       const handleApplyDiff = (diff) => {
@@ -3023,20 +3051,33 @@ Rispondi con JSON ESATTO:
             </>
           )}
 
-          {view === 'text' && (
-            <div className="bg-zinc-950 border border-zinc-800 rounded-xl p-4">
-              <p className="text-xs text-zinc-500 mb-3">
-                Formato Moxfield/Arena. Click "Copia decklist" in alto per copiare tutto.
-              </p>
-              <pre className="text-xs font-mono text-zinc-200 whitespace-pre overflow-x-auto scrollbar-thin">
+          {view === 'text' && (() => {
+            const validCards = generated.cards.filter(c => c.found !== false);
+            const invalidCards = generated.cards.filter(c => c.found === false);
+            return (
+              <div className="bg-zinc-950 border border-zinc-800 rounded-xl p-4">
+                <p className="text-xs text-zinc-500 mb-3">
+                  Formato Moxfield/Arena. Click "Copia decklist" in alto per copiare tutto.
+                  {invalidCards.length > 0 && (
+                    <span className="block mt-1 text-amber-400">
+                      ⚠ {invalidCards.length} carte non verificate su Scryfall sono state escluse dalla decklist principale.
+                      Le trovi in fondo come riferimento.
+                    </span>
+                  )}
+                </p>
+                <pre className="text-xs font-mono text-zinc-200 whitespace-pre overflow-x-auto scrollbar-thin">
 {`Commander:
 1 ${generated.commander_name}
 
 Deck:
-${generated.cards.map(c => `1 ${c.name}${c.found === false ? '  // NON TROVATA' : ''}`).join('\n')}`}
-              </pre>
-            </div>
-          )}
+${validCards.map(c => `1 ${c.name}`).join('\n')}${invalidCards.length > 0 ? `
+
+# Carte NON verificate su Scryfall (escluse dalla decklist):
+${invalidCards.map(c => `# - ${c.name}`).join('\n')}` : ''}`}
+                </pre>
+              </div>
+            );
+          })()}
         </div>
       );
     }
@@ -4682,11 +4723,28 @@ ${cardData}`;
           isCommander: c.name === newCommanderName,
         }));
         const newCommander = newCards.find(c => c.isCommander);
-        onUpdateData({
+        // Invalido auto-detect e validazione custom: erano calcolati sul commander vecchio
+        const update = {
           ...data,
           cards: newCards,
           commander: newCommander,
-        });
+          commander_changed_in_confirm: true,
+          // Reset di analisi e dati derivati che dipendono dal commander
+          _reset_downstream: true,
+        };
+        if (data.archetypeMode === 'auto') {
+          update.autoDetected = data.autoDetected ? {
+            ...data.autoDetected,
+            stale: true,
+          } : null;
+        }
+        if (data.archetypeMode === 'custom' && data.customValidation) {
+          update.customValidation = {
+            ...data.customValidation,
+            stale: true,
+          };
+        }
+        onUpdateData(update);
       };
 
       const handleSaveEditedArchetype = () => {
@@ -4762,6 +4820,20 @@ ${cardData}`;
               </div>
             </div>
 
+            {/* Avviso: commander cambiato dopo l'auto-detect */}
+            {data.commander_changed_in_confirm && (data.autoDetected?.stale || data.customValidation?.stale) && (
+              <div className="mt-4 bg-amber-950/40 border border-amber-700/40 rounded-lg p-3">
+                <p className="text-xs text-amber-300 font-medium">
+                  ⚠ Hai cambiato comandante dopo l'analisi della strategia.
+                </p>
+                <p className="text-xs text-amber-200 mt-1">
+                  L'interpretazione qui sotto è stata fatta sul comandante precedente. Per un'analisi accurata, ti consiglio di
+                  tornare indietro (← Indietro) e ricominciare con il comandante giusto. Oppure procedi e modifica
+                  manualmente la strategia col bottone "Non sono d'accordo, modifica".
+                </p>
+              </div>
+            )}
+
             {/* Box modalità archetipo */}
             <div className="mt-4 bg-zinc-950 border border-zinc-800 rounded-lg p-4">
               <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
@@ -4771,6 +4843,9 @@ ${cardData}`;
                   {data.archetypeMode === 'custom' && <span className="text-[10px] bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded">Personalizzata</span>}
                   {data.autoDetected?.user_edited && (
                     <span className="text-[10px] bg-emerald-900/40 text-emerald-300 px-2 py-0.5 rounded">Modificata da te</span>
+                  )}
+                  {(data.autoDetected?.stale || data.customValidation?.stale) && (
+                    <span className="text-[10px] bg-amber-900/60 text-amber-200 px-2 py-0.5 rounded">⚠ stale (commander cambiato)</span>
                   )}
                 </div>
                 {data.archetypeMode === 'auto' && !editingArchetype && (
@@ -5567,7 +5642,25 @@ ${cardData}`;
               data?.archetypeMode === 'custom' ? "Recupero le carte e valido la tua strategia…" :
               "Sto recuperando le carte da Scryfall…"
             } />}
-            {phase === 'confirm' && data && <ConfirmStep data={data} onConfirm={handleConfirm} onBack={handleReset} onUpdateData={setData} />}
+            {phase === 'confirm' && data && <ConfirmStep
+              data={data}
+              onConfirm={handleConfirm}
+              onBack={handleReset}
+              onUpdateData={(newData) => {
+                if (newData._reset_downstream) {
+                  // Cambio commander → resetto tutti gli state derivati
+                  setSynergies(null);
+                  setRecommendations(null);
+                  setGenerated(null);
+                  // Pulisco il flag prima di salvare
+                  const cleaned = { ...newData };
+                  delete cleaned._reset_downstream;
+                  setData(cleaned);
+                } else {
+                  setData(newData);
+                }
+              }}
+            />}
             {phase === 'analyzing' && <LoadingScreen message={analyzingPhaseMsg} />}
             {phase === 'results' && analysis && scores && (
               <ResultsView
@@ -5595,7 +5688,7 @@ ${cardData}`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.12 · Tagging AI-refined · Input separato · Validazione strategia · Pacchetti tematici · Pool ibrido
+            v0.13 · Bug fixes (cambio commander, decklist pulita, bracket check)
           </footer>
         </div>
       );
