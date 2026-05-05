@@ -1531,6 +1531,7 @@ ${data.customStrategy}`,
     // 4. Validazione + check finale + motivazioni in batch
     async function generateOptimizedDeck({
       commander, archetypeContext, bracketTarget, edhrecPool,
+      poolMetadata, // info sul pool ibrido (EDHREC + Scryfall)
       mode, // 'fromScratch' o 'optimize'
       existingCards, // solo per mode 'optimize'
       synergiesData, // solo per mode 'optimize': risultato dalla tab Sinergie
@@ -1609,11 +1610,22 @@ ${data.customStrategy}`,
       // === PASSAGGIO 3: Claude sceglie le carte non-land ===
       if (onProgress) onProgress({ phase: `Claude seleziona ${targetNonLand} carte non-land...`, step: 4, total: 6 });
 
-      const nonLandPool = (edhrecPool || []).filter(c => {
+      // Costruisci il poolStr distinguendo EDHREC (popolari) da Scryfall mirate (gemme tematiche)
+      const nonLandPoolWithSource = (edhrecPool || []).filter(c => {
         const sc = poolFetched[c.name.toLowerCase()];
         return sc && !(sc.type_line || '').toLowerCase().includes('land');
       });
-      const poolStr = nonLandPool.map((c, i) => `${i+1}. ${c.name}`).join('\n');
+      const edhrecCardsPool = nonLandPoolWithSource.filter(c => c.source === 'edhrec' || !c.source);
+      const themedCardsPool = nonLandPoolWithSource.filter(c => c.source === 'scryfall_themed');
+
+      let poolStrEdhrec = edhrecCardsPool.slice(0, 200).map((c, i) => `${i+1}. ${c.name}`).join('\n');
+      let poolStrThemed = themedCardsPool.slice(0, 150).map((c, i) => `${i+1}. ${c.name}`).join('\n');
+      const poolStr = `=== A) CARTE POPOLARI EDHREC (${edhrecCardsPool.length} totali, mostro le prime 200) ===
+${poolStrEdhrec || '(nessuna)'}
+
+=== B) CARTE TEMATICHE DA SCRYFALL (${themedCardsPool.length} totali, mostro le prime 150) ===
+Queste sono carte trovate con query mirate sui temi della strategia. Includono "gemme nascoste" che EDHREC non evidenzia.
+${poolStrThemed || '(nessuna)'}`;
 
       const bracketRules = {
         1: 'Bracket 1: niente Game Changer, no MLD, no extra turn, no combo. Casual.',
@@ -1650,7 +1662,7 @@ BRACKET TARGET: ${bracketTarget} — ${bracketRules[bracketTarget]}
 NUMERO TERRE GIÀ FISSATO: ${targetLands} (le ho scelte separatamente, NON includerle nella tua risposta)
 DEVI SCEGLIERE ESATTAMENTE: ${targetNonLand} carte non-land
 
-POOL EDHREC (carte non-land popolari per questo commander):
+POOL DI CARTE DISPONIBILI:
 ${poolStr}
 ${whitelistInstruction}
 ${blacklistInstruction}
@@ -1663,9 +1675,12 @@ COMPITO:
 3. Rispetta il bracket e le whitelist/blacklist sopra
 4. Le carte devono esistere e rispettare la color identity ${colorIdentity}
 5. Mescola scelte canoniche con sinergie meno ovvie ma valide per QUESTO commander
-6. Spiega in 4-6 frasi italiano la filosofia di costruzione, includendo:
+6. IMPORTANTE: pesca ATTIVAMENTE dal gruppo B (carte tematiche da Scryfall) — sono lì apposta per darti opzioni meno ovvie ma sinergiche. Punta a includere almeno 8-15 carte dal gruppo B se sono adatte alla strategia. Non limitarti al gruppo A (popolari EDHREC).
+7. Puoi anche scegliere carte FUORI dal pool se sai che sono ottime per la strategia (legali in color identity ${colorIdentity})
+8. Spiega in 4-6 frasi italiano la filosofia di costruzione, includendo:
    - Quali pacchetti tematici hai costruito
    - Come la lista esegue la strategia
+   - Quali "gemme tematiche" del gruppo B hai scelto e perché
    - Eventuali deviazioni dai range standard e perché
 
 Rispondi con JSON ESATTO:
@@ -1852,6 +1867,18 @@ JSON:
         keptFromOriginal: cards.filter(c => c.source === 'kept_from_original').length,
       });
 
+      // Marca le carte non-land aggiunte se vengono dal pool tematico Scryfall
+      const themedPoolNames = new Set(
+        (edhrecPool || [])
+          .filter(c => c.source === 'scryfall_themed')
+          .map(c => c.name.toLowerCase())
+      );
+      cards.forEach(c => {
+        if (c.category !== 'land' && themedPoolNames.has(c.name.toLowerCase())) {
+          c.from_themed_pool = true;
+        }
+      });
+
       return {
         build_notes: selection.build_notes || '',
         construction_logic: constructionLogic,
@@ -1866,6 +1893,7 @@ JSON:
         not_found: allNotFound,
         whitelist_used: whitelistKeep.map(w => w.name),
         blacklist_used: [...blacklistExclude],
+        pool_metadata: poolMetadata || null,
         generated_at: new Date().toISOString(),
       };
     }
@@ -2322,6 +2350,9 @@ Rispondi con JSON ESATTO:
                 {card.source === 'basic' && (
                   <span className="text-[10px] bg-zinc-800 text-zinc-400 border border-zinc-700 px-1.5 py-0.5 rounded uppercase">base</span>
                 )}
+                {card.from_themed_pool && (
+                  <span className="text-[10px] bg-fuchsia-900/40 text-fuchsia-300 border border-fuchsia-700/30 px-1.5 py-0.5 rounded uppercase" title="Trovata via query Scryfall mirata sui temi della strategia">gemma</span>
+                )}
                 {card.source === 'modification' && (
                   <span className="text-[10px] bg-amber-900/40 text-amber-300 border border-amber-700/30 px-1.5 py-0.5 rounded uppercase">modifica</span>
                 )}
@@ -2374,14 +2405,20 @@ Rispondi con JSON ESATTO:
         try {
           const archetypeContext = getEffectiveArchetypeContext(data);
 
-          setProgress({ phase: 'Recupero il pool da EDHREC...', step: 0, total: 6 });
-          const edhrecPool = await fetchEdhrecTopCards(data.commander.name);
+          setProgress({ phase: 'Costruisco il pool ibrido EDHREC + Scryfall mirato...', step: 0, total: 6 });
+          const hybridPoolData = await buildHybridPool({
+            commander: data.commander,
+            archetypeContext,
+            apiKey,
+            onProgress: setProgress,
+          });
 
           const result = await generateOptimizedDeck({
             commander: data.commander,
             archetypeContext,
             bracketTarget: data.bracketTarget,
-            edhrecPool,
+            edhrecPool: hybridPoolData.pool,
+            poolMetadata: hybridPoolData,
             mode: genMode,
             existingCards: genMode === 'optimize' ? analysis.all_cards : null,
             synergiesData: genMode === 'optimize' ? synergies : null,
@@ -2617,6 +2654,44 @@ Rispondi con JSON ESATTO:
             </details>
           )}
 
+          {/* Pool ibrido EDHREC + Scryfall */}
+          {generated.pool_metadata && (
+            <details className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+              <summary className="cursor-pointer text-sm font-semibold text-zinc-300 hover:text-amber-400">
+                🔍 Pool ibrido usato (clicca per espandere) — {generated.cards.filter(c => c.from_themed_pool).length} gemme tematiche scelte
+              </summary>
+              <div className="mt-3 space-y-3">
+                <div className="grid grid-cols-3 gap-3 text-center">
+                  <div className="bg-zinc-950 border border-zinc-800 rounded p-3">
+                    <div className="text-2xl font-bold text-blue-300">{generated.pool_metadata.edhrec_count}</div>
+                    <div className="text-[10px] text-zinc-500 uppercase">da EDHREC</div>
+                  </div>
+                  <div className="bg-zinc-950 border border-zinc-800 rounded p-3">
+                    <div className="text-2xl font-bold text-fuchsia-300">{generated.pool_metadata.scryfall_count}</div>
+                    <div className="text-[10px] text-zinc-500 uppercase">da Scryfall mirate</div>
+                  </div>
+                  <div className="bg-zinc-950 border border-zinc-800 rounded p-3">
+                    <div className="text-2xl font-bold text-emerald-300">{generated.pool_metadata.unique_count}</div>
+                    <div className="text-[10px] text-zinc-500 uppercase">pool totale unico</div>
+                  </div>
+                </div>
+                {generated.pool_metadata.query_stats && generated.pool_metadata.query_stats.length > 0 && (
+                  <div>
+                    <div className="text-xs text-zinc-500 uppercase mb-2">Query Scryfall eseguite:</div>
+                    <div className="space-y-1.5">
+                      {generated.pool_metadata.query_stats.map((q, i) => (
+                        <div key={i} className="bg-zinc-950 border border-zinc-800 rounded p-2 text-xs">
+                          <div className="font-mono text-fuchsia-300">{q.query}</div>
+                          <div className="text-zinc-500 mt-0.5">{q.rationale} — <span className="text-zinc-300">{q.count} risultati</span></div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </details>
+          )}
+
           {/* Distribuzione */}
           <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
             <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-3">Distribuzione carte</h4>
@@ -2794,6 +2869,142 @@ Rispondi con questo JSON:
     }
 
     // Recupera le top inclusions per il commander da EDHREC
+    // ============================================================
+    // POOL IBRIDO: EDHREC + SCRYFALL MIRATO PER TEMA
+    // ============================================================
+
+    // Chiede a Claude di costruire query Scryfall mirate sui temi del mazzo
+    async function generateScryfallQueries(commander, archetypeContext, apiKey) {
+      const colorIdentity = (commander.color_identity || []).join('') || 'C';
+      const ciClause = colorIdentity === 'C' ? 'id:c' : `id<=${colorIdentity.toLowerCase()}`;
+
+      const sys = `Sei un esperto di Magic: The Gathering e dell'API Scryfall. Costruisci query Scryfall mirate per trovare carte tematicamente rilevanti per un commander e una strategia, oltre alle solite inclusioni popolari. Le query devono usare la sintassi Scryfall (t: per type, o: per oracle text, c: per color, id<= per color identity, mv per mana value). Rispondi SOLO con JSON.`;
+
+      const usr = `COMANDANTE: ${commander.name}
+TESTO: ${commander.oracle_text}
+COLOR IDENTITY: ${colorIdentity}
+STRATEGIA: ${archetypeContext.full_context}
+
+Costruisci 6-10 query Scryfall ottimizzate per trovare carte SINERGICHE con questo commander e strategia, OLTRE alle carte popolari standard. L'obiettivo è trovare gemme nascoste sinergiche, non duplicare il consenso EDHREC.
+
+REGOLE:
+- Ogni query deve includere ${ciClause} per rispettare la color identity
+- Usa termini specifici dell'archetipo (es. per Voja: t:wolf, t:human, o:"+1/+1 counter")
+- Mescola query tematiche (per tipo creatura), funzionali (per effetto), e payoff specifici
+- Una query può essere più larga (es. tutte le creature di un tipo), un'altra più stretta (es. carte che fanno X quando Y)
+- Evita query troppo generiche tipo solo "id<=..." che ritornerebbe migliaia di carte
+
+JSON:
+{
+  "queries": [
+    {"query": "stringa Scryfall", "rationale": "perché questa query in 8-12 parole italiano", "max_results": 30},
+    ...
+  ]
+}
+
+Esempio per un Voja tribal Lupi/Umani Selesnya:
+{
+  "queries": [
+    {"query": "t:wolf id<=gw mv<=5", "rationale": "lupi nella color identity per il tema tribal", "max_results": 25},
+    {"query": "t:human id<=gw mv<=5 (o:create or o:enters)", "rationale": "umani con ETB per token o trigger", "max_results": 25},
+    {"query": "o:'+1/+1 counter' id<=gw t:creature mv<=4", "rationale": "creature che producono +1/+1 counter", "max_results": 20},
+    {"query": "o:'token' id<=gw o:'wolf' or o:'human'", "rationale": "generatori di token tribali", "max_results": 20},
+    {"query": "id<=gw o:'protection from' t:equipment or t:enchantment", "rationale": "protezione tematica per Voltron-like", "max_results": 15}
+  ]
+}`;
+
+      try {
+        const text = await callClaude(apiKey, sys, usr, 1500);
+        const parsed = extractJsonFromResponse(text);
+        return Array.isArray(parsed.queries) ? parsed.queries : [];
+      } catch (e) {
+        console.warn('Generazione query Scryfall fallita:', e);
+        return [];
+      }
+    }
+
+    // Esegue una singola query Scryfall con paginazione
+    async function executeScryfallQuery(query, maxResults = 30) {
+      try {
+        const url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(query)}&order=edhrec&unique=cards`;
+        const res = await fetch(url);
+        if (!res.ok) {
+          if (res.status === 404) return []; // nessun risultato
+          console.warn(`Scryfall query fallita (${query}):`, res.status);
+          return [];
+        }
+        const json = await res.json();
+        const data = json.data || [];
+        return data.slice(0, maxResults).map(c => ({
+          name: c.name,
+          source: 'scryfall_themed',
+          query_used: query,
+          edhrec_rank: c.edhrec_rank || 999999,
+        }));
+      } catch (e) {
+        console.warn(`Errore query Scryfall (${query}):`, e);
+        return [];
+      }
+    }
+
+    // Costruisce il pool ibrido: EDHREC + Scryfall mirato
+    async function buildHybridPool({ commander, archetypeContext, apiKey, onProgress }) {
+      if (onProgress) onProgress({ phase: 'Recupero pool EDHREC...', step: 1, total: 4 });
+      const edhrecCards = await fetchEdhrecTopCards(commander.name);
+
+      if (onProgress) onProgress({ phase: 'Claude genera query Scryfall mirate...', step: 2, total: 4 });
+      const queries = await generateScryfallQueries(commander, archetypeContext, apiKey);
+
+      if (onProgress) onProgress({ phase: `Eseguo ${queries.length} query Scryfall mirate...`, step: 3, total: 4 });
+      const scryfallCards = [];
+      const queryStats = [];
+
+      for (let i = 0; i < queries.length; i++) {
+        const q = queries[i];
+        if (onProgress) onProgress({
+          phase: `Query Scryfall ${i+1}/${queries.length}: ${q.rationale.slice(0, 50)}...`,
+          step: 3,
+          total: 4
+        });
+        const results = await executeScryfallQuery(q.query, q.max_results || 30);
+        scryfallCards.push(...results);
+        queryStats.push({ query: q.query, rationale: q.rationale, count: results.length });
+        await new Promise(r => setTimeout(r, 100)); // gentile rate limit
+      }
+
+      if (onProgress) onProgress({ phase: 'Unisco e dedup il pool ibrido...', step: 4, total: 4 });
+
+      // Dedup: priorità a EDHREC (con synergy score) ma include scryfall_themed
+      const seen = new Set();
+      const hybridPool = [];
+
+      // Prima EDHREC (le marchio come 'edhrec')
+      edhrecCards.forEach(c => {
+        const key = c.name.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          hybridPool.push({ ...c, source: 'edhrec' });
+        }
+      });
+
+      // Poi Scryfall mirate (solo se non già presenti da EDHREC)
+      scryfallCards.forEach(c => {
+        const key = c.name.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          hybridPool.push(c);
+        }
+      });
+
+      return {
+        pool: hybridPool,
+        edhrec_count: edhrecCards.length,
+        scryfall_count: scryfallCards.length,
+        unique_count: hybridPool.length,
+        query_stats: queryStats,
+      };
+    }
+
     async function fetchEdhrecTopCards(commanderName) {
       try {
         // EDHREC slug: lowercase, spazi → dash, no apostrofi/virgole
@@ -4577,7 +4788,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.8 · Generator + Modifiche post-generazione · Range archetipo dinamici · Scryfall + Claude + Spellbook + EDHREC
+            v0.9 · Pool ibrido EDHREC + Scryfall mirato · Generator + Modifiche · Range archetipo · Claude + Spellbook
           </footer>
         </div>
       );
