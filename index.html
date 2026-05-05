@@ -425,6 +425,104 @@ ${cardList}`;
       return results;
     }
 
+    // Identifica i pacchetti tematici di carte che lavorano insieme
+    // (sinergie carta↔carta, non solo carta↔commander)
+    async function identifyThematicPackages(cards, commander, profile, archetype, apiKey, archetypeContext) {
+      const archetypeLabel = archetypeContext?.label || ARCHETYPES[archetype]?.label || archetype;
+      const archetypeFullContext = archetypeContext?.full_context || `Archetipo: ${archetypeLabel}`;
+
+      // Filtra le carte non-land non-commander e non terre base
+      const BASIC_LANDS = ['plains','island','swamp','mountain','forest','wastes',
+        'snow-covered plains','snow-covered island','snow-covered swamp',
+        'snow-covered mountain','snow-covered forest'];
+      const relevantCards = cards.filter(c =>
+        !c.isCommander &&
+        !BASIC_LANDS.includes(c.name.toLowerCase()) &&
+        !c.tags?.includes('land')
+      );
+
+      if (relevantCards.length < 10) return [];
+
+      const cardSummary = relevantCards
+        .map(c => `${c.name} | ${c.type_line.replace(/—.*/, '').trim()} | ${(c.oracle_text || '').slice(0, 200)}`)
+        .join('\n');
+
+      const sys = `Sei un esperto di Magic: The Gathering Commander. Identifichi PACCHETTI TEMATICI in un mazzo: gruppi di 2-4 carte che lavorano insieme producendo un effetto, loop, motore o combo che le singole carte da sole non producono. Sii rigoroso: includi solo pacchetti REALI dove le carte si potenziano a vicenda, non semplici sovrapposizioni di funzione (es. "due ramp" non è un pacchetto, "ramp + payoff per molto mana" sì). Rispondi SOLO con JSON valido.`;
+
+      const usr = `COMANDANTE: ${commander.name}
+TESTO COMMANDER: ${commander.oracle_text}
+PROFILO: ${JSON.stringify(profile)}
+STRATEGIA: ${archetypeFullContext}
+
+CARTE NEL MAZZO (escluse terre):
+${cardSummary}
+
+Identifica 4-10 PACCHETTI TEMATICI presenti nel mazzo. Un pacchetto è un gruppo di 2-4 carte che producono insieme:
+- un loop ripetibile
+- un payoff condizionale che si attiva per la presenza dell'altra carta
+- una combo finita o quasi-finita (anche se non infinita)
+- un motore di vantaggio sinergico (sacrifice + token + drain, ecc.)
+- una catena di trigger (ETB → death trigger, untap → tap-for-mana, ecc.)
+
+REGOLE:
+- Solo pacchetti REALI: le carte devono interagire direttamente, non solo "essere coerenti col tema"
+- Il commander può fare parte del pacchetto se è centrale
+- Indica importanza 1-10: 10 = pacchetto pillar del mazzo, 1 = micro-sinergia minore
+- Per ogni carta nel pacchetto, indica se è il "pezzo chiave" (senza cui il pacchetto non funziona)
+
+JSON:
+{
+  "packages": [
+    {
+      "name": "Nome breve del pacchetto in italiano (es. 'Loop sacrifice + drain')",
+      "cards": ["Nome carta 1", "Nome carta 2", "..."],
+      "key_pieces": ["Nome carta che è il pezzo chiave"],
+      "what_it_does": "12-25 parole italiano: cosa fa il pacchetto insieme",
+      "trigger_or_loop": "se è un loop, descrivi la sequenza in 1 riga; se è un payoff condizionale, descrivi la condizione",
+      "importance": 1-10,
+      "category": "combo | loop | engine | payoff | tribal_chain | protection_chain"
+    }
+  ]
+}`;
+
+      try {
+        const text = await callClaude(apiKey, sys, usr, 3500);
+        const parsed = extractJsonFromResponse(text);
+        if (Array.isArray(parsed.packages)) {
+          // Validazione: tutte le carte devono essere nel mazzo
+          const cardNamesSet = new Set(cards.map(c => c.name.toLowerCase()));
+          cardNamesSet.add(commander.name.toLowerCase());
+          return parsed.packages
+            .map(p => ({
+              ...p,
+              cards: (p.cards || []).filter(n => cardNamesSet.has((n || '').toLowerCase())),
+              key_pieces: (p.key_pieces || []).filter(n => cardNamesSet.has((n || '').toLowerCase())),
+            }))
+            .filter(p => p.cards.length >= 2)
+            .sort((a, b) => (b.importance || 0) - (a.importance || 0));
+        }
+      } catch (e) {
+        console.warn('Identificazione pacchetti fallita:', e);
+      }
+      return [];
+    }
+
+    // Restituisce il set di carte "protette dai pacchetti": non vanno tagliate
+    // anche se da sole sembrano deboli, perché sono pezzi chiave di pacchetti importanti
+    function getPackageProtectedCards(packages) {
+      const protectedSet = new Set();
+      (packages || []).forEach(pkg => {
+        if ((pkg.importance || 0) >= 5) {
+          (pkg.key_pieces || []).forEach(name => protectedSet.add(name.toLowerCase()));
+          // Se il pacchetto è molto importante, proteggi tutte le sue carte, non solo i key
+          if ((pkg.importance || 0) >= 7) {
+            (pkg.cards || []).forEach(name => protectedSet.add(name.toLowerCase()));
+          }
+        }
+      });
+      return protectedSet;
+    }
+
     // ============================================================
     // COMPONENTI FASE 2 — Modal API key + Tab Sinergie
     // ============================================================
@@ -556,6 +654,64 @@ ${cardList}`;
       );
     }
 
+    function ThematicPackageCard({ pkg }) {
+      const catColors = {
+        combo:            'bg-fuchsia-900/30 text-fuchsia-300 border-fuchsia-700/40',
+        loop:             'bg-purple-900/30 text-purple-300 border-purple-700/40',
+        engine:           'bg-emerald-900/30 text-emerald-300 border-emerald-700/40',
+        payoff:           'bg-amber-900/30 text-amber-300 border-amber-700/40',
+        tribal_chain:     'bg-pink-900/30 text-pink-300 border-pink-700/40',
+        protection_chain: 'bg-blue-900/30 text-blue-300 border-blue-700/40',
+      };
+      const cls = catColors[pkg.category] || 'bg-zinc-800 text-zinc-300 border-zinc-700';
+      const importanceColor = pkg.importance >= 8 ? 'text-emerald-400'
+        : pkg.importance >= 5 ? 'text-amber-400'
+        : 'text-zinc-400';
+      const keyPiecesSet = new Set((pkg.key_pieces || []).map(s => s.toLowerCase()));
+
+      return (
+        <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-4">
+          <div className="flex items-start gap-3 mb-2">
+            <div className={`text-xl font-bold w-10 text-center ${importanceColor}`}>{pkg.importance || '?'}</div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 flex-wrap mb-1">
+                <h4 className="font-medium text-zinc-100">{pkg.name}</h4>
+                <span className={`${cls} border text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase`}>
+                  {pkg.category}
+                </span>
+              </div>
+              <p className="text-sm text-zinc-300">{pkg.what_it_does}</p>
+              {pkg.trigger_or_loop && (
+                <p className="text-xs text-zinc-500 mt-1 italic">↻ {pkg.trigger_or_loop}</p>
+              )}
+            </div>
+          </div>
+          <div className="ml-13 mt-2 flex flex-wrap gap-1">
+            {(pkg.cards || []).map((cardName, i) => {
+              const isKey = keyPiecesSet.has(cardName.toLowerCase());
+              const scryfallUrl = `https://scryfall.com/search?q=!"${encodeURIComponent(cardName)}"`;
+              return (
+                <a
+                  key={i}
+                  href={scryfallUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className={`text-xs px-2 py-1 rounded border ${
+                    isKey
+                      ? 'bg-amber-950/40 border-amber-700/50 text-amber-200 font-medium'
+                      : 'bg-zinc-900 border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                  }`}
+                  title={isKey ? 'Pezzo chiave del pacchetto' : 'Carta del pacchetto'}
+                >
+                  {isKey && '★ '}{cardName}
+                </a>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
     function SynergyResults({ synergies, cards, commander, onRerun }) {
       const [filter, setFilter] = useState('all');
       const profile = synergies.profile || {};
@@ -634,6 +790,26 @@ ${cardList}`;
             </div>
           </div>
 
+          {/* Pacchetti tematici */}
+          {synergies.packages && synergies.packages.length > 0 && (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+              <div className="flex items-center justify-between mb-1">
+                <h3 className="text-sm font-semibold text-zinc-300">
+                  Pacchetti tematici ({synergies.packages.length})
+                </h3>
+                <span className="text-[10px] text-zinc-500">★ = pezzo chiave</span>
+              </div>
+              <p className="text-xs text-zinc-500 mb-4">
+                Gruppi di carte che lavorano insieme producendo un effetto, loop o motore. Le carte qui dentro non vengono tagliate dai cuts, anche se da sole sembrano deboli.
+              </p>
+              <div className="space-y-3">
+                {synergies.packages.map((pkg, i) => (
+                  <ThematicPackageCard key={i} pkg={pkg} />
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
             <h3 className="text-sm font-semibold mb-3 text-zinc-300">Carte per categoria di sinergia</h3>
             <div className="flex flex-wrap gap-1.5 mb-4">
@@ -691,7 +867,17 @@ ${cardList}`;
             archetypeContext
           );
 
-          const result = { profile, scores };
+          setProgress({ current: 0, total: 0, phase: 'Identifico i pacchetti tematici...' });
+          const packages = await identifyThematicPackages(
+            analysis.all_cards,
+            data.commander,
+            profile,
+            data.archetype,
+            apiKey,
+            archetypeContext
+          );
+
+          const result = { profile, scores, packages };
           setSynergies(result);
           saveToCache(cacheKey, result);
           setRunning(false);
@@ -1568,9 +1754,31 @@ ${data.customStrategy}`,
         Object.entries(synergiesData.scores).forEach(([cardName, syn]) => {
           // Tieni le carte enabler/amplifier/protector/tribal/combo_piece con score >= 7
           if (['enabler', 'amplifier', 'protector', 'tribal'].includes(syn.category) && syn.score >= 7) {
-            whitelistKeep.push({ name: cardName, category: syn.category, score: syn.score });
+            whitelistKeep.push({ name: cardName, category: syn.category, score: syn.score, source: 'synergy' });
           }
         });
+
+        // Aggiungi anche le carte chiave dei pacchetti tematici importanti
+        const protectedByPackages = getPackageProtectedCards(synergiesData.packages || []);
+        const alreadyInWhitelist = new Set(whitelistKeep.map(w => w.name.toLowerCase()));
+        protectedByPackages.forEach(cardNameLower => {
+          if (!alreadyInWhitelist.has(cardNameLower)) {
+            // Recupera il nome originale dalle scores (case-sensitive)
+            const originalName = Object.keys(synergiesData.scores).find(
+              n => n.toLowerCase() === cardNameLower
+            );
+            if (originalName) {
+              const syn = synergiesData.scores[originalName];
+              whitelistKeep.push({
+                name: originalName,
+                category: syn?.category || 'package_piece',
+                score: syn?.score || 7,
+                source: 'package',
+              });
+            }
+          }
+        });
+
         whitelistKeep.sort((a, b) => b.score - a.score);
       }
 
@@ -2549,7 +2757,10 @@ Rispondi con JSON ESATTO:
                 <div className="mb-4 bg-emerald-950/40 border border-emerald-700/40 rounded-lg p-3">
                   <div className="text-xs text-emerald-300">
                     ✓ Userò {Object.values(synergies.scores).filter(s => ['enabler','amplifier','protector','tribal'].includes(s.category) && s.score >= 7).length} carte forti come whitelist
-                    e {recommendations.cuts?.length || 0} carte da escludere come blacklist
+                    {synergies.packages && synergies.packages.length > 0 && (
+                      <> + {synergies.packages.filter(p => (p.importance || 0) >= 5).length} pacchetti tematici da preservare</>
+                    )}
+                    , e {recommendations.cuts?.length || 0} carte da escludere come blacklist
                   </div>
                 </div>
               )}
@@ -2783,12 +2994,25 @@ ${generated.cards.map(c => `1 ${c.name}${c.found === false ? '  // NON TROVATA' 
     // Seleziona i candidati al taglio dalle sinergie
     function selectCutCandidates(synergies, cards, maxCuts = 8) {
       if (!synergies?.scores) return [];
+
+      // Costruisci il set di carte protette dai pacchetti tematici
+      const protectedByPackages = getPackageProtectedCards(synergies.packages || []);
+
       const candidates = [];
+      const skippedByProtection = [];
+
       cards.forEach(c => {
         if (c.isCommander) return;
         if (c.tags?.includes('land')) return; // i lands non li tagliamo da qui
         const syn = synergies.scores[c.name];
         if (!syn) return;
+
+        // Se la carta è protetta da un pacchetto importante, non la candidiamo al taglio
+        if (protectedByPackages.has(c.name.toLowerCase())) {
+          skippedByProtection.push({ name: c.name, category: syn.category, score: syn.score });
+          return;
+        }
+
         // Priority: misfit (peggiori) > redundant > utility_generic con score basso
         let priority = 0;
         if (syn.category === 'misfit') priority = 100 - syn.score;
@@ -2799,7 +3023,10 @@ ${generated.cards.map(c => `1 ${c.name}${c.found === false ? '  // NON TROVATA' 
         candidates.push({ card: c, synergy: syn, priority });
       });
       candidates.sort((a, b) => b.priority - a.priority);
-      return candidates.slice(0, maxCuts);
+      const result = candidates.slice(0, maxCuts);
+      // Attacchiamo info sulle carte protette per debug/UI
+      result.protectedSkipped = skippedByProtection;
+      return result;
     }
 
     // Per ogni cut, chiede a Claude 3 alternative
@@ -3271,7 +3498,12 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
             archetypeContext
           );
 
-          const result = { cuts, adds, generatedAt: new Date().toISOString() };
+          const result = {
+            cuts,
+            adds,
+            protected_skipped: candidates.protectedSkipped || [],
+            generatedAt: new Date().toISOString(),
+          };
           setRecommendations(result);
           saveToCache(cacheKey, result);
           setRunning(false);
@@ -3379,6 +3611,23 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
                     <span className="text-blue-400 ml-2">laterale</span> (sapore diverso),
                     <span className="text-emerald-400 ml-2">tematica</span> (rinforza l'archetipo).
                   </div>
+                  {recommendations.protected_skipped && recommendations.protected_skipped.length > 0 && (
+                    <details className="bg-zinc-950 border border-zinc-800 rounded-lg p-3">
+                      <summary className="cursor-pointer text-xs text-amber-300 font-medium">
+                        🛡 {recommendations.protected_skipped.length} carte salvate dai pacchetti tematici (clicca per vedere)
+                      </summary>
+                      <div className="mt-2 text-xs text-zinc-400">
+                        Queste carte sembrano deboli da sole ma sono pezzi chiave di pacchetti tematici importanti, quindi non vanno tagliate:
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {recommendations.protected_skipped.map((p, i) => (
+                          <span key={i} className="text-[11px] bg-amber-950/30 border border-amber-700/30 text-amber-200 px-2 py-0.5 rounded">
+                            {p.name} <span className="text-amber-500/60">({p.category}, {p.score}/10)</span>
+                          </span>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                   {recommendations.cuts.map((cut, i) => (
                     <CutCard key={i} cut={cut} />
                   ))}
@@ -4788,7 +5037,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.9 · Pool ibrido EDHREC + Scryfall mirato · Generator + Modifiche · Range archetipo · Claude + Spellbook
+            v0.10 · Pacchetti tematici · Pool ibrido · Generator + Modifiche · Range archetipo
           </footer>
         </div>
       );
