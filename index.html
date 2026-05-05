@@ -3838,7 +3838,241 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
         tags.push('threat_creature');
       }
 
+      // === REGEX RINFORZATE per casi noti ===
+
+      // Draw engines che NON usano "draw a card" letterale
+      // Necropotence: "set aside the top card... add it to your hand"
+      // Bolas's Citadel: "you may play the top card of your library"
+      // Sylvan Library: "draw two additional cards"
+      // Esper Sentinel: trigger draw on opponents casting
+      if (!tags.includes('draw_engine')) {
+        if (/set aside.*card.*library.*put.*into your hand/i.test(text)
+            || /look at the top card of your library.*play/i.test(text)
+            || /draw \w+ additional cards?/i.test(text)
+            || /(?:whenever|when).*(?:cast|enters|attacks).*draw/i.test(text)) {
+          tags.push('draw_engine');
+        }
+      }
+
+      // Skullclamp pattern: equipment che pesca quando muore
+      if (!tags.includes('draw_engine') && types.includes('equipment')
+          && /equipped creature.*\+\d/i.test(text)
+          && /(?:when|whenever).*equipped.*dies.*draw/i.test(text)) {
+        tags.push('draw_engine');
+      }
+
+      // Smothering Tithe / Rhystic Study pattern: trigger su gioco avversario
+      if (!tags.includes('draw_engine') && !tags.includes('ramp_rock')) {
+        if (/whenever an opponent.*draws? a card/i.test(text)
+            && /(?:create.*treasure|may pay|draw a card)/i.test(text)) {
+          tags.push('draw_engine');
+        }
+      }
+
+      // Treasure / artifact token producers come ramp_rock funzionali
+      if (!tags.includes('ramp_rock') && /create.*treasure token/i.test(text)
+          && (cmc <= 3 || /whenever/i.test(text))) {
+        tags.push('ramp_rock');
+      }
+
+      // Mana doubler (Mana Reflection, Doubling Cube) come ramp engine
+      if (!tags.includes('ramp_rock') && /mana.*tap.*double|adds (?:an additional|twice|that much)/i.test(text)) {
+        tags.push('ramp_rock');
+      }
+
+      // Cost reducer come ramp implicito (Goblin Electromancer, Urza's Incubator)
+      if (!tags.includes('ramp_rock')
+          && /(?:cost|spells).*(?:less to cast|cost \{[\d]\} less)/i.test(text)) {
+        tags.push('ramp_rock');
+      }
+
+      // Wheel effects: discard hand + draw 7 (Wheel of Fortune, Windfall, ecc.)
+      if (!tags.includes('draw_engine') && !tags.includes('draw_card')) {
+        if (/discard.*hand.*draw \w+ cards?/i.test(text)
+            || /shuffle.*hand.*library.*draw \w+ cards?/i.test(text)
+            || /each player.*discard.*draw \w+ cards?/i.test(text)) {
+          tags.push('draw_engine');
+        }
+      }
+
+      // Recursion engine: ricorrenza ripetibile (Sun Titan, Eternal Witness, Reveillark)
+      if (!tags.includes('recursion') && /(?:when|whenever).*return.*(?:from|to).*graveyard/i.test(text)) {
+        tags.push('recursion');
+      }
+
+      // Sacrifice outlet — categorizzato come enabler di pacchetti aristocrats
+      if (isCreature && /sacrifice (?:a|another) creature/i.test(text)
+          && /(?:add|put|create|deal|draw)/i.test(text)) {
+        // È un sacrifice outlet (Phyrexian Altar, Yawgmoth, Ashnod's Altar pattern)
+        // Non aggiungo un tag dedicato per non spaccare lo schema, ma lo segnalo come engine
+        if (!tags.includes('draw_engine') && /draw/i.test(text)) tags.push('draw_engine');
+      }
+
+      // Token generators frequenti
+      // (li lascio non taggati esplicitamente perché non c'è tag "token_gen" nello schema,
+      // ma se aggiungono creature alla fine sono già coperti da threat_creature implicito)
+
+      // Win condition esplicite oltre quelle già taggate
+      if (!tags.includes('finisher')) {
+        if (/each opponent loses.*life/i.test(text) && /\d{2,}|life total/i.test(text)) {
+          tags.push('finisher');
+        }
+        // Combo enabler famosi
+        if (/^bolas's citadel|^aetherflux reservoir|^thassa's oracle|^laboratory maniac/i.test(card.name || '')) {
+          tags.push('finisher');
+        }
+      }
+
       return tags;
+    }
+
+    // ============================================================
+    // REFINEMENT TAGS VIA CLAUDE
+    // Per le carte che le regex non sanno categorizzare, chiediamo a Claude.
+    // ============================================================
+
+    // Determina se una carta ha tag "significativi" o se è ancora ambigua
+    function hasMeaningfulTags(card) {
+      const tags = card.tags || [];
+      // Tag che NON contano come "significativi" (sono solo descrittori, non funzioni)
+      const nonFunctional = new Set(['land', 'fixing_land', 'utility_land']);
+      const meaningful = tags.filter(t => !nonFunctional.has(t));
+      return meaningful.length > 0;
+    }
+
+    // Tag validi che Claude può assegnare. Devono coincidere con quelli di tagCard.
+    const ALLOWED_TAGS = [
+      'ramp_rock', 'ramp_dork', 'ramp_land', 'ramp_ritual',
+      'draw_card', 'draw_engine',
+      'removal_targeted', 'removal_creature', 'removal_noncreature', 'removal_pw', 'removal_mass',
+      'counterspell',
+      'tutor_unconditional', 'tutor_creature', 'tutor_spell', 'tutor_artifact', 'tutor_enchantment', 'tutor_specific',
+      'recursion', 'protection', 'extra_turn', 'mld', 'finisher', 'threat_creature',
+    ];
+
+    // Refina i tag delle carte usando Claude (solo per quelle senza tag funzionali)
+    async function refineTagsWithClaude(cards, apiKey, onProgress) {
+      // Considera solo non-land senza tag funzionali significativi
+      const ambiguous = cards.filter(c =>
+        !c.isCommander &&
+        !c.tags?.includes('land') &&
+        !hasMeaningfulTags(c)
+      );
+
+      if (ambiguous.length === 0) {
+        if (onProgress) onProgress({ done: 0, total: 0, phase: 'Nessuna carta ambigua' });
+        return { refinedCount: 0, ambiguousNames: [], result: cards };
+      }
+
+      const BATCH_SIZE = 25;
+      const batches = [];
+      for (let i = 0; i < ambiguous.length; i += BATCH_SIZE) {
+        batches.push(ambiguous.slice(i, i + BATCH_SIZE));
+      }
+
+      const sys = `Sei un esperto di Magic: The Gathering. Ti vengono date carte difficili da categorizzare automaticamente. Per ognuna, assegna 1-3 tag funzionali tra quelli ammessi. Se una carta non ha funzione chiara nello schema, restituisci array vuoto. Rispondi SOLO con JSON valido.`;
+
+      const tagsList = ALLOWED_TAGS.join(', ');
+      const refinedMap = {};
+      let processedBatches = 0;
+
+      for (const batch of batches) {
+        if (onProgress) {
+          onProgress({
+            done: processedBatches,
+            total: batches.length,
+            phase: `Refining batch ${processedBatches + 1}/${batches.length}`,
+          });
+        }
+
+        const cardData = batch.map((c, i) => {
+          return `${i+1}. NAME: ${c.name}
+TYPE: ${c.type_line || '?'}
+CMC: ${c.cmc || 0}
+ORACLE: ${(c.oracle_text || '').slice(0, 400)}`;
+        }).join('\n\n');
+
+        const usr = `Tag ammessi: ${tagsList}
+
+DEFINIZIONI dei tag (RIGOROSE):
+- ramp_rock: artefatto/incantesimo che produce mana o riduce costi (es. Sol Ring, Smothering Tithe, mana doublers, cost reducers)
+- ramp_dork: creatura che produce mana (es. Llanowar Elves)
+- ramp_land: spell che cerca/mette in gioco una terra (es. Cultivate, Three Visits)
+- ramp_ritual: aggiunge mana una tantum a costo basso (es. Dark Ritual, Cabal Ritual)
+- draw_card: pesca una tantum (es. Read the Bones, Sign in Blood)
+- draw_engine: motore ripetibile di card draw o vantaggio (es. Necropotence, Sylvan Library, Esper Sentinel, Skullclamp, Phyrexian Arena, Rhystic Study, Mystic Remora)
+- removal_targeted: rimuove/distrugge target singolo
+- removal_creature: rimuove specificamente creature
+- removal_noncreature: rimuove artefatti/incantesimi
+- removal_pw: rimuove planeswalker
+- removal_mass: spazza-via (Wrath effect)
+- counterspell: contrasta una magia
+- tutor_*: cerca carte specifiche dalla libreria
+- recursion: riporta carte dal cimitero
+- protection: protegge creature/te (hexproof, indestructible, ward, save da removal)
+- extra_turn: turno aggiuntivo
+- mld: Mass Land Destruction
+- finisher: vince esplicitamente la partita o è win-con
+- threat_creature: creatura che minaccia di vincere (grossa/evasion)
+
+REGOLE:
+- Una carta può avere PIÙ tag se davvero ha più funzioni
+- Se la carta è puro filler senza funzione chiara, restituisci array vuoto: []
+- NON inventare tag fuori dalla lista
+- Sii rigoroso: utility generica NON è draw_engine (un tutor da 5 mana che pesca una carta una volta NON è engine)
+
+Rispondi:
+{
+  "items": [
+    {"name": "Nome esatto", "tags": ["tag1", "tag2"]}
+  ]
+}
+
+CARTE:
+${cardData}`;
+
+        try {
+          const text = await callClaude(apiKey, sys, usr, 2500);
+          const parsed = extractJsonFromResponse(text);
+          if (Array.isArray(parsed.items)) {
+            parsed.items.forEach(item => {
+              if (item.name && Array.isArray(item.tags)) {
+                const validTags = item.tags.filter(t => ALLOWED_TAGS.includes(t));
+                refinedMap[item.name.toLowerCase()] = validTags;
+              }
+            });
+          }
+        } catch (e) {
+          console.warn(`Refine batch fallito:`, e);
+        }
+        processedBatches++;
+        await new Promise(r => setTimeout(r, 150));
+      }
+
+      // Applica i tag refinati alle carte
+      const result = cards.map(c => {
+        const newTags = refinedMap[c.name.toLowerCase()];
+        if (newTags && newTags.length > 0) {
+          // Aggiungi i nuovi tag a quelli esistenti, evitando duplicati
+          const merged = [...new Set([...(c.tags || []), ...newTags])];
+          return { ...c, tags: merged, tags_refined_by_ai: true };
+        }
+        return c;
+      });
+
+      if (onProgress) {
+        onProgress({
+          done: batches.length,
+          total: batches.length,
+          phase: 'Refinement completato',
+        });
+      }
+
+      return {
+        refinedCount: Object.values(refinedMap).filter(t => t.length > 0).length,
+        ambiguousNames: ambiguous.map(c => c.name),
+        result,
+      };
     }
 
     // ============================================================
@@ -4889,6 +5123,15 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
             </div>
           </div>
 
+          {/* Info refinement Claude se presente */}
+          {data.refinement_info && data.refinement_info.refined_count > 0 && (
+            <div className="bg-emerald-950/30 border border-emerald-700/30 rounded-xl p-4 text-xs text-emerald-300">
+              ✨ Tagging migliorato da Claude: ho identificato funzioni in <strong>{data.refinement_info.refined_count}</strong> carte
+              su <strong>{data.refinement_info.ambiguous_total}</strong> che le regex non riuscivano a categorizzare.
+              I conteggi qui sotto includono questi tag, che si possono vedere con badge ✨ nella tabella carte.
+            </div>
+          )}
+
           {/* Conteggi dettagliati */}
           <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
             <h3 className="text-sm font-semibold mb-4 text-zinc-300">Composizione del mazzo</h3>
@@ -5064,6 +5307,9 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
                     <td className="py-2 pr-2 font-medium">
                       {c.isCommander && <span className="text-amber-400 mr-1">★</span>}
                       <a href={c.scryfall_uri} target="_blank" rel="noreferrer" className="hover:text-amber-400">{c.name}</a>
+                      {c.tags_refined_by_ai && (
+                        <span className="ml-1.5 text-emerald-400 text-[10px]" title="Tag identificati da Claude">✨</span>
+                      )}
                     </td>
                     <td className="pr-2"><ManaCost cost={c.mana_cost} /></td>
                     <td className="pr-2 text-xs text-zinc-400">{(c.type_line || '').replace(/—.*/, '').trim()}</td>
@@ -5237,22 +5483,53 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
         }
       };
 
-      const handleConfirm = () => {
+      const [analyzingPhaseMsg, setAnalyzingPhaseMsg] = useState('Sto analizzando il mazzo…');
+
+      const handleConfirm = async () => {
         setPhase('analyzing');
         setStep(2);
-        setTimeout(() => {
-          try {
-            const ana = analyzeDeck(data.cards);
-            const sc = computeScores(ana, data.archetype);
-            setAnalysis(ana);
-            setScores(sc);
-            setPhase('results');
-            setStep(3);
-          } catch (e) {
-            setError(e.message);
-            setPhase('error');
+        setAnalyzingPhaseMsg('Sto analizzando il mazzo…');
+        try {
+          let workingCards = data.cards;
+
+          // Step: refine tag con Claude se abbiamo la chiave (e ci sono carte ambigue)
+          if (apiKey) {
+            setAnalyzingPhaseMsg('Refining tag funzionali con Claude…');
+            try {
+              const refineResult = await refineTagsWithClaude(workingCards, apiKey, (p) => {
+                if (p.total > 0) {
+                  setAnalyzingPhaseMsg(`Refining tag funzionali… (${p.done}/${p.total})`);
+                }
+              });
+              if (refineResult.refinedCount > 0) {
+                workingCards = refineResult.result;
+                // Aggiorno data.cards con quelli refinati per mantenere coerenza
+                setData({
+                  ...data,
+                  cards: workingCards,
+                  refinement_info: {
+                    refined_count: refineResult.refinedCount,
+                    ambiguous_total: refineResult.ambiguousNames.length,
+                  },
+                });
+              }
+            } catch (e) {
+              console.warn('Refinement failed, fallback alle regex:', e);
+            }
           }
-        }, 300);
+
+          setAnalyzingPhaseMsg('Calcolo conteggi e score…');
+          await new Promise(r => setTimeout(r, 100));
+          const ana = analyzeDeck(workingCards);
+          const sc = computeScores(ana, data.archetype);
+          setAnalysis(ana);
+          setScores(sc);
+          setPhase('results');
+          setStep(3);
+        } catch (e) {
+          setError(e.message);
+          setPhase('error');
+        }
       };
 
       const handleReset = () => {
@@ -5291,7 +5568,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
               "Sto recuperando le carte da Scryfall…"
             } />}
             {phase === 'confirm' && data && <ConfirmStep data={data} onConfirm={handleConfirm} onBack={handleReset} onUpdateData={setData} />}
-            {phase === 'analyzing' && <LoadingScreen message="Sto analizzando il mazzo…" />}
+            {phase === 'analyzing' && <LoadingScreen message={analyzingPhaseMsg} />}
             {phase === 'results' && analysis && scores && (
               <ResultsView
                 data={data}
@@ -5318,7 +5595,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.11 · Input migliorato · Validazione strategia custom · Cambio commander · Pacchetti tematici
+            v0.12 · Tagging AI-refined · Input separato · Validazione strategia · Pacchetti tematici · Pool ibrido
           </footer>
         </div>
       );
