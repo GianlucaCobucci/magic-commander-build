@@ -1456,6 +1456,7 @@ JSON:
     // ============================================================
 
     // Auto-rileva archetipo leggendo decklist + commander
+    // Auto-rileva archetipo leggendo decklist + commander
     async function autoDetectArchetype(commander, cards, apiKey) {
       const sys = `Sei un esperto di Magic: The Gathering Commander. Analizza un mazzo e identifica archetipo principale, eventuali sotto-temi, e piano di gioco. Rispondi SOLO con JSON valido, no markdown fences.`;
 
@@ -1489,6 +1490,55 @@ JSON:
       return extractJsonFromResponse(text);
     }
 
+    // Ricava un archetipo "vicino" dalla descrizione testuale, cercando keyword
+    function resolveArchetypeFromDescription(text) {
+      const t = (text || '').toLowerCase();
+      const keywordMap = [
+        ['cedh combo', 'cedh_combo'], ['cedh stax', 'cedh_stax'], ['cedh', 'cedh_midrange'],
+        ['voltron', 'voltron'], ['aristocrat', 'aristocrats'], ['reanimator', 'reanimator'],
+        ['control', 'control'], ['token', 'tokens'], ['tribal', 'tribal'],
+        ['spellslinger', 'spellslinger'], ['lands matter', 'lands_matter'],
+        ['big mana', 'big_mana'], ['ramp aggressivo', 'big_mana'],
+        ['stax', 'cedh_stax'], ['combo', 'cedh_combo'], ['aggro', 'midrange'],
+      ];
+      for (const [kw, key] of keywordMap) {
+        if (t.includes(kw) && ARCHETYPES[key]) return key;
+      }
+      return null;
+    }
+
+    // Valida la coerenza tra descrizione custom dell'utente e il commander.
+    // Se l'utente scrive un piano insensato per quel commander, lo segnaliamo.
+    async function validateCustomStrategy(commander, customStrategy, apiKey) {
+      const sys = `Sei un esperto di Magic: The Gathering Commander. Ricevi un commander e una descrizione di strategia che l'utente vuole giocare. Devi: (1) interpretare cosa l'utente intende, (2) verificare se la strategia è ragionevolmente eseguibile con quel commander, (3) segnalare incoerenze gravi se ci sono. Sii rigoroso ma non rigido: piani non standard ma fattibili sono OK; piani che contraddicono il commander sono da segnalare. Rispondi SOLO con JSON valido.`;
+
+      const usr = `COMANDANTE: ${commander.name}
+TESTO COMMANDER: ${commander.oracle_text}
+COLOR IDENTITY: ${(commander.color_identity || []).join('') || 'C'}
+
+DESCRIZIONE STRATEGIA DALL'UTENTE:
+"${customStrategy}"
+
+Analizza:
+1. interpretation: 2-3 frasi italiano che descrivono COME hai interpretato la richiesta dell'utente
+2. coherence_score: 0-10 (10 = strategia perfettamente eseguibile con questo commander, 5 = ci sono compromessi, 0 = strategia incompatibile)
+3. compatible: true/false (false solo se la strategia è davvero insensata per questo commander)
+4. concerns: array di stringhe — eventuali avvertimenti specifici (es. "il commander non aiuta direttamente la strategia X", "manca un colore necessario per Y", "richiederà tagli sul piano principale di Z"). Vuoto se tutto bene.
+5. suggestions: array di stringhe — 1-3 suggerimenti per affinare la strategia o aggiungere elementi utili. Vuoto se non servono.
+
+JSON:
+{
+  "interpretation": "...",
+  "coherence_score": 0-10,
+  "compatible": true,
+  "concerns": ["..."],
+  "suggestions": ["..."]
+}`;
+
+      const text = await callClaude(apiKey, sys, usr, 1000);
+      return extractJsonFromResponse(text);
+    }
+
     // Restituisce la "descrizione effettiva" dell'archetipo da usare nei prompt
     // Combina il preset con eventuale auto-detect o descrizione custom
     function getEffectiveArchetypeContext(data) {
@@ -1513,12 +1563,16 @@ Win conditions: ${(data.autoDetected.win_conditions || []).join('; ')}.`,
         };
       }
       if (archetypeMode === 'custom') {
+        const userText = data.customStrategy || '';
+        const interpretation = data.customValidation?.interpretation || '';
+        const fullCtx = interpretation
+          ? `Strategia personalizzata definita dall'utente:\n${userText}\n\nInterpretazione validata da Claude:\n${interpretation}`
+          : `Strategia personalizzata definita dall'utente:\n${userText}`;
         return {
           mode: 'custom',
           label: 'Strategia personalizzata',
-          description: data.customStrategy || '',
-          full_context: `Strategia personalizzata definita dall'utente:
-${data.customStrategy}`,
+          description: userText,
+          full_context: fullCtx,
         };
       }
       return {
@@ -4178,31 +4232,68 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
     }
 
     function InputStep({ onAnalyze }) {
-      const [decklist, setDecklist] = useState('');
-      const [archetypeMode, setArchetypeMode] = useState('preset'); // preset | auto | custom
-      const [archetype, setArchetype] = useState('midrange');
+      const [commanderInput, setCommanderInput] = useState('');
+      const [mainboardInput, setMainboardInput] = useState('');
+      const [archetypeMode, setArchetypeMode] = useState('auto'); // auto | custom
       const [customStrategy, setCustomStrategy] = useState('');
       const [bracketTarget, setBracketTarget] = useState(3);
       const [error, setError] = useState('');
 
+      const bracketDescriptions = {
+        1: 'Exhibition — mazzi tematici e deboli, no carte forti, no fast mana, no combo, gioco molto casual.',
+        2: 'Core — livello precon. No Game Changer, no MLD, no extra turn chain, no combo infinite, no fast mana.',
+        3: 'Upgraded — precon potenziato. Massimo 3 Game Changer ammessi, no MLD, no extra turn chain, no combo a 2 carte facili. Tutor moderati.',
+        4: 'Optimized — non-cEDH ottimizzato. Tutto ammesso ma il mazzo deve restare coerente con la sua strategia.',
+        5: 'cEDH — meta competitivo da torneo. Massima ottimizzazione, win turn medio basso.',
+      };
+
       const handleSubmit = () => {
-        const parsed = parseDecklist(decklist);
+        // Combina commander + mainboard in un'unica decklist con marker
+        const cmdrTrim = commanderInput.trim();
+        const mainTrim = mainboardInput.trim();
+
+        if (!cmdrTrim && !mainTrim) {
+          setError('Inserisci almeno il commander e qualche carta del mazzo.');
+          return;
+        }
+
+        // Costruisci la decklist combinata: prima il commander con marker, poi il mainboard
+        let combinedDecklist = '';
+        if (cmdrTrim) {
+          combinedDecklist += `Commander:\n${cmdrTrim}\n\n`;
+        }
+        if (mainTrim) {
+          combinedDecklist += `Deck:\n${mainTrim}`;
+        }
+
+        const parsed = parseDecklist(combinedDecklist);
+
         if (parsed.cards.length === 0) {
-          setError('Non riesco a leggere nessuna carta. Controlla il formato.');
+          setError('Non riesco a leggere nessuna carta. Controlla i formati.');
           return;
         }
         if (parsed.cards.length < 50) {
-          setError(`Ho letto solo ${parsed.cards.length} carte. Sei sicuro che la decklist sia completa?`);
+          setError(`Ho letto solo ${parsed.cards.length} carte totali. Sei sicuro che il mazzo sia completo?`);
           return;
         }
+
+        // Se non c'è un commander esplicitamente marcato, ma l'utente ha inserito qualcosa
+        // nel campo commander, il parser dovrebbe averlo già preso. Se invece c'è solo
+        // una creatura legendary nel mainboard, sarà rilevata in fase successiva.
+        if (!parsed.commanderHint && !cmdrTrim) {
+          setError('Specifica il commander nel campo apposito in alto, oppure aggiungi *CMDR* dopo il nome nel mainboard.');
+          return;
+        }
+
         if (archetypeMode === 'custom' && customStrategy.trim().length < 20) {
           setError('La descrizione personalizzata deve essere almeno 20 caratteri.');
           return;
         }
+
         setError('');
         onAnalyze({
           ...parsed,
-          archetype,
+          archetype: 'midrange', // fallback iniziale, verrà aggiornato in modalità auto
           archetypeMode,
           customStrategy: customStrategy.trim(),
           bracketTarget,
@@ -4212,38 +4303,51 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
       return (
         <div className="max-w-3xl mx-auto">
           <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
-            <h2 className="text-lg font-semibold mb-1">Incolla la tua decklist</h2>
+            <h2 className="text-lg font-semibold mb-1">Inserisci il tuo mazzo</h2>
             <p className="text-sm text-zinc-400 mb-4">
               Formato Moxfield, Arena o MTGO. Una carta per riga, con quantità.
-              Per il comandante: scrivilo nella sezione <code className="bg-zinc-800 px-1 rounded">Commander:</code> oppure aggiungi <code className="bg-zinc-800 px-1 rounded">*CMDR*</code> a fine riga.
             </p>
 
-            <textarea
-              value={decklist}
-              onChange={e => setDecklist(e.target.value)}
-              placeholder={"Commander:\n1 Atraxa, Praetors' Voice\n\n1 Sol Ring\n1 Cultivate\n..."}
-              className="w-full h-64 bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm font-mono text-zinc-200 resize-none focus:outline-none focus:border-amber-500/50 scrollbar-thin"
-            />
+            {/* Campo Commander separato */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-zinc-300 mb-1.5">
+                Comandante <span className="text-zinc-500 font-normal">(la creatura leggendaria che guida il mazzo)</span>
+              </label>
+              <textarea
+                value={commanderInput}
+                onChange={e => setCommanderInput(e.target.value)}
+                placeholder={"1 Atraxa, Praetors' Voice"}
+                className="w-full h-12 bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm font-mono text-zinc-200 resize-none focus:outline-none focus:border-amber-500/50"
+              />
+              <p className="text-[10px] text-zinc-600 mt-1">
+                Scrivi solo una riga: <code className="bg-zinc-800 px-1 rounded">1 Nome Carta</code>. Per partner/background, due righe.
+              </p>
+            </div>
 
-            {/* Selettore modalità archetipo */}
+            {/* Campo Mainboard */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-zinc-300 mb-1.5">
+                Mainboard <span className="text-zinc-500 font-normal">(le altre 99 carte)</span>
+              </label>
+              <textarea
+                value={mainboardInput}
+                onChange={e => setMainboardInput(e.target.value)}
+                placeholder={"1 Sol Ring\n1 Arcane Signet\n1 Cultivate\n..."}
+                className="w-full h-56 bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm font-mono text-zinc-200 resize-none focus:outline-none focus:border-amber-500/50 scrollbar-thin"
+              />
+            </div>
+
+            {/* Selettore modalità archetipo: solo Auto + Custom */}
             <div className="mt-5">
-              <label className="block text-sm font-medium text-zinc-300 mb-2">Come definisci l'archetipo del mazzo?</label>
+              <label className="block text-sm font-medium text-zinc-300 mb-2">Strategia del mazzo</label>
               <div className="flex bg-zinc-950 border border-zinc-800 rounded-lg p-1 mb-3">
-                <button
-                  onClick={() => setArchetypeMode('preset')}
-                  className={`flex-1 px-3 py-1.5 text-xs font-medium rounded ${
-                    archetypeMode === 'preset' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'
-                  }`}
-                >
-                  Preset rapido
-                </button>
                 <button
                   onClick={() => setArchetypeMode('auto')}
                   className={`flex-1 px-3 py-1.5 text-xs font-medium rounded ${
                     archetypeMode === 'auto' ? 'bg-amber-500 text-black' : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
-                  Auto-rileva
+                  Auto-rileva (consigliato)
                 </button>
                 <button
                   onClick={() => setArchetypeMode('custom')}
@@ -4255,28 +4359,13 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
                 </button>
               </div>
 
-              {archetypeMode === 'preset' && (
-                <div>
-                  <select
-                    value={archetype}
-                    onChange={e => setArchetype(e.target.value)}
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-2.5 text-sm focus:outline-none focus:border-amber-500/50"
-                  >
-                    {Object.entries(ARCHETYPES).map(([k, v]) => (
-                      <option key={k} value={k}>{v.label}</option>
-                    ))}
-                  </select>
-                  <p className="text-xs text-zinc-500 mt-1">{ARCHETYPES[archetype].description}</p>
-                </div>
-              )}
-
               {archetypeMode === 'auto' && (
                 <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3">
                   <p className="text-xs text-zinc-400">
-                    Claude leggerà tutto il mazzo e dedurrà archetipo principale, sotto-temi e piano di gioco. Costo aggiuntivo: ~2 centesimi.
+                    Claude leggerà tutto il mazzo e dedurrà archetipo principale, sotto-temi e piano di gioco. Vedrai l'interpretazione nella schermata successiva e potrai correggerla se necessario.
                   </p>
-                  <p className="text-xs text-amber-400 mt-1.5">
-                    Richiede chiave API Claude (te la chiederò se non l'hai impostata).
+                  <p className="text-[10px] text-zinc-600 mt-1.5">
+                    Costo aggiuntivo: ~2 centesimi · Richiede chiave API Claude
                   </p>
                 </div>
               )}
@@ -4290,7 +4379,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
                     className="w-full h-24 bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm text-zinc-200 resize-none focus:outline-none focus:border-amber-500/50"
                   />
                   <p className="text-xs text-zinc-500 mt-1">
-                    Descrivi in italiano come deve giocare il mazzo. Più sei specifico, meglio Claude calibrerà l'analisi.
+                    Descrivi in italiano come deve giocare il mazzo. Claude verificherà se la tua descrizione è coerente con il commander e te lo segnalerà nella schermata successiva.
                   </p>
                 </div>
               )}
@@ -4309,6 +4398,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
                 <option value={4}>4 — Optimized</option>
                 <option value={5}>5 — cEDH</option>
               </select>
+              <p className="text-xs text-zinc-500 mt-1.5">{bracketDescriptions[bracketTarget]}</p>
             </div>
 
             {error && (
@@ -4319,7 +4409,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
 
             <button
               onClick={handleSubmit}
-              disabled={!decklist.trim()}
+              disabled={!commanderInput.trim() && !mainboardInput.trim()}
               className="mt-5 w-full bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-black font-semibold py-2.5 rounded-lg transition-colors"
             >
               Analizza il mazzo
@@ -4333,15 +4423,60 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
       );
     }
 
-    function ConfirmStep({ data, onConfirm, onBack }) {
+    function ConfirmStep({ data, onConfirm, onBack, onUpdateData }) {
       const cmdr = data.commander;
       const ci = cmdr?.color_identity || [];
       const archCtx = getEffectiveArchetypeContext(data);
+      const [editingArchetype, setEditingArchetype] = useState(false);
+      const [editedDescription, setEditedDescription] = useState(
+        data.archetypeMode === 'auto' ? (data.autoDetected?.strategy_description || '') : ''
+      );
+
+      // Trova tutte le creature leggendarie nel mazzo (candidate per essere commander)
+      const legendaryCandidates = (data.cards || []).filter(c =>
+        c.type_line && c.type_line.toLowerCase().includes('legendary') &&
+        c.type_line.toLowerCase().includes('creature')
+      );
+      const canChangeCommander = legendaryCandidates.length > 1 ||
+        (legendaryCandidates.length === 1 && !cmdr) ||
+        legendaryCandidates.length >= 1;
+
+      const handleChangeCommander = (newCommanderName) => {
+        if (!onUpdateData) return;
+        const newCards = data.cards.map(c => ({
+          ...c,
+          isCommander: c.name === newCommanderName,
+        }));
+        const newCommander = newCards.find(c => c.isCommander);
+        onUpdateData({
+          ...data,
+          cards: newCards,
+          commander: newCommander,
+        });
+      };
+
+      const handleSaveEditedArchetype = () => {
+        if (!onUpdateData) return;
+        const trimmed = editedDescription.trim();
+        if (trimmed.length < 20) return;
+        // Mantengo la modalità auto ma sovrascrivo la strategy_description
+        onUpdateData({
+          ...data,
+          autoDetected: {
+            ...(data.autoDetected || {}),
+            strategy_description: trimmed,
+            user_edited: true,
+          },
+        });
+        setEditingArchetype(false);
+      };
+
+      const validation = data.customValidation;
 
       return (
         <div className="max-w-3xl mx-auto">
           <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
-            <h2 className="text-lg font-semibold mb-4">Conferma comandante e mazzo</h2>
+            <h2 className="text-lg font-semibold mb-4">Conferma comandante e strategia</h2>
 
             <div className="flex gap-4">
               {cmdr?.image && (
@@ -4361,45 +4496,168 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
                   <div>Carte totali nel mazzo: <span className="font-semibold text-zinc-100">{data.cards.length}</span></div>
                   <div>Bracket target: <span className="font-semibold text-zinc-100">{data.bracketTarget}</span></div>
                   {data.notFound && data.notFound.length > 0 && (
-                    <div className="mt-2 text-amber-400">
-                      Non trovate su Scryfall ({data.notFound.length}): {data.notFound.slice(0,3).join(', ')}{data.notFound.length > 3 ? '…' : ''}
+                    <div className="mt-2 text-amber-400 text-xs">
+                      <div>Non trovate su Scryfall ({data.notFound.length}):</div>
+                      <div className="font-mono mt-1 text-amber-300">
+                        {data.notFound.join(', ')}
+                      </div>
                     </div>
                   )}
                 </div>
+
+                {/* Cambia commander se ci sono altre opzioni */}
+                {canChangeCommander && legendaryCandidates.length > 1 && (
+                  <div className="mt-3 pt-3 border-t border-zinc-800">
+                    <label className="text-xs text-zinc-500 uppercase tracking-wider">
+                      Cambia comandante
+                    </label>
+                    <select
+                      value={cmdr?.name || ''}
+                      onChange={e => handleChangeCommander(e.target.value)}
+                      className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded-lg p-2 text-sm focus:outline-none focus:border-amber-500/50"
+                    >
+                      {legendaryCandidates.map(lc => (
+                        <option key={lc.name} value={lc.name}>{lc.name}</option>
+                      ))}
+                    </select>
+                    <p className="text-[10px] text-zinc-600 mt-1">
+                      Sono presenti {legendaryCandidates.length} creature leggendarie. Se quella riconosciuta è sbagliata, scegline un'altra qui.
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
 
             {/* Box modalità archetipo */}
             <div className="mt-4 bg-zinc-950 border border-zinc-800 rounded-lg p-4">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-xs text-zinc-500 uppercase tracking-wider">Strategia / archetipo</span>
-                {data.archetypeMode === 'preset' && <span className="text-[10px] bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded">Preset</span>}
-                {data.archetypeMode === 'auto' && <span className="text-[10px] bg-amber-900/40 text-amber-300 px-2 py-0.5 rounded">Auto-rilevato</span>}
-                {data.archetypeMode === 'custom' && <span className="text-[10px] bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded">Personalizzato</span>}
+              <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-zinc-500 uppercase tracking-wider">Strategia</span>
+                  {data.archetypeMode === 'auto' && <span className="text-[10px] bg-amber-900/40 text-amber-300 px-2 py-0.5 rounded">Auto-rilevata</span>}
+                  {data.archetypeMode === 'custom' && <span className="text-[10px] bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded">Personalizzata</span>}
+                  {data.autoDetected?.user_edited && (
+                    <span className="text-[10px] bg-emerald-900/40 text-emerald-300 px-2 py-0.5 rounded">Modificata da te</span>
+                  )}
+                </div>
+                {data.archetypeMode === 'auto' && !editingArchetype && (
+                  <button
+                    onClick={() => setEditingArchetype(true)}
+                    className="text-xs text-zinc-400 hover:text-amber-400"
+                  >
+                    Non sono d'accordo, modifica →
+                  </button>
+                )}
               </div>
-              <div className="text-sm font-medium text-zinc-200">{archCtx.label}</div>
-              {archCtx.description && (
-                <p className="text-xs text-zinc-400 mt-1.5">{archCtx.description}</p>
+
+              {!editingArchetype && (
+                <>
+                  <div className="text-sm font-medium text-zinc-200">{archCtx.label}</div>
+                  {archCtx.description && (
+                    <p className="text-xs text-zinc-400 mt-1.5">{archCtx.description}</p>
+                  )}
+                  {data.archetypeMode === 'auto' && data.autoDetected?.secondary_themes && data.autoDetected.secondary_themes.length > 0 && (
+                    <div className="mt-2">
+                      <span className="text-[10px] text-zinc-500 uppercase">Sotto-temi rilevati:</span>
+                      <div className="flex flex-wrap gap-1 mt-1">
+                        {data.autoDetected.secondary_themes.map((t, i) => (
+                          <span key={i} className="text-[10px] bg-purple-900/30 text-purple-300 px-1.5 py-0.5 rounded">{t}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {data.archetypeMode === 'auto' && data.autoDetected?.win_conditions && data.autoDetected.win_conditions.length > 0 && (
+                    <div className="mt-2">
+                      <span className="text-[10px] text-zinc-500 uppercase">Win conditions:</span>
+                      <ul className="text-xs text-zinc-400 list-disc list-inside mt-0.5">
+                        {data.autoDetected.win_conditions.map((w, i) => <li key={i}>{w}</li>)}
+                      </ul>
+                    </div>
+                  )}
+                </>
               )}
-              {data.archetypeMode === 'auto' && data.autoDetected?.secondary_themes && data.autoDetected.secondary_themes.length > 0 && (
-                <div className="mt-2">
-                  <span className="text-[10px] text-zinc-500 uppercase">Sotto-temi rilevati:</span>
-                  <div className="flex flex-wrap gap-1 mt-1">
-                    {data.autoDetected.secondary_themes.map((t, i) => (
-                      <span key={i} className="text-[10px] bg-purple-900/30 text-purple-300 px-1.5 py-0.5 rounded">{t}</span>
-                    ))}
+
+              {editingArchetype && (
+                <div>
+                  <textarea
+                    value={editedDescription}
+                    onChange={e => setEditedDescription(e.target.value)}
+                    className="w-full h-28 bg-zinc-900 border border-zinc-700 rounded-lg p-2 text-sm text-zinc-200 resize-none focus:outline-none focus:border-amber-500/50"
+                    placeholder="Modifica la descrizione della strategia..."
+                  />
+                  <p className="text-[10px] text-zinc-600 mt-1">
+                    Sostituirai l'interpretazione automatica con la tua. Le tab successive useranno questa descrizione.
+                  </p>
+                  <div className="flex gap-2 mt-2">
+                    <button
+                      onClick={() => { setEditingArchetype(false); setEditedDescription(data.autoDetected?.strategy_description || ''); }}
+                      className="text-xs px-3 py-1 bg-zinc-800 hover:bg-zinc-700 rounded"
+                    >
+                      Annulla
+                    </button>
+                    <button
+                      onClick={handleSaveEditedArchetype}
+                      disabled={editedDescription.trim().length < 20}
+                      className="text-xs px-3 py-1 bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-black font-medium rounded"
+                    >
+                      Salva
+                    </button>
                   </div>
                 </div>
               )}
-              {data.archetypeMode === 'auto' && data.autoDetected?.win_conditions && (
-                <div className="mt-2">
-                  <span className="text-[10px] text-zinc-500 uppercase">Win conditions:</span>
-                  <ul className="text-xs text-zinc-400 list-disc list-inside mt-0.5">
-                    {data.autoDetected.win_conditions.map((w, i) => <li key={i}>{w}</li>)}
-                  </ul>
-                </div>
-              )}
             </div>
+
+            {/* Validazione custom strategy */}
+            {data.archetypeMode === 'custom' && validation && (
+              <div className={`mt-4 rounded-lg p-4 border ${
+                validation.compatible === false
+                  ? 'bg-red-950/30 border-red-700/40'
+                  : (validation.coherence_score || 10) >= 7
+                    ? 'bg-emerald-950/30 border-emerald-700/40'
+                    : 'bg-amber-950/30 border-amber-700/40'
+              }`}>
+                <div className="flex items-center justify-between mb-2">
+                  <span className={`text-xs uppercase tracking-wider font-semibold ${
+                    validation.compatible === false ? 'text-red-300' :
+                    (validation.coherence_score || 10) >= 7 ? 'text-emerald-300' : 'text-amber-300'
+                  }`}>
+                    Verifica della tua descrizione
+                  </span>
+                  <span className={`text-xs font-mono ${
+                    validation.compatible === false ? 'text-red-300' :
+                    (validation.coherence_score || 10) >= 7 ? 'text-emerald-300' : 'text-amber-300'
+                  }`}>
+                    Coerenza: {validation.coherence_score}/10
+                  </span>
+                </div>
+                {validation.interpretation && (
+                  <div className="mb-2">
+                    <span className="text-[10px] text-zinc-500 uppercase">Ho capito:</span>
+                    <p className="text-sm text-zinc-200 mt-0.5">{validation.interpretation}</p>
+                  </div>
+                )}
+                {validation.concerns && validation.concerns.length > 0 && (
+                  <div className="mb-2">
+                    <span className="text-[10px] text-zinc-500 uppercase">⚠ Avvertimenti:</span>
+                    <ul className="text-xs text-zinc-300 list-disc list-inside mt-0.5">
+                      {validation.concerns.map((c, i) => <li key={i}>{c}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {validation.suggestions && validation.suggestions.length > 0 && (
+                  <div>
+                    <span className="text-[10px] text-zinc-500 uppercase">💡 Suggerimenti:</span>
+                    <ul className="text-xs text-zinc-300 list-disc list-inside mt-0.5">
+                      {validation.suggestions.map((s, i) => <li key={i}>{s}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {validation.compatible === false && (
+                  <p className="text-xs text-red-300 mt-2 font-medium">
+                    Ti consiglio di tornare indietro e riformulare la descrizione, oppure cambiare commander.
+                  </p>
+                )}
+              </div>
+            )}
 
             <div className="flex gap-2 mt-6">
               <button onClick={onBack} className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-sm">Indietro</button>
@@ -4952,6 +5210,25 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
             }
           }
 
+          // Se modalità custom, valida la coerenza della descrizione con il commander
+          if (parsedData.archetypeMode === 'custom' && commander && parsedData.customStrategy) {
+            if (!apiKey) {
+              setShowApiKeyModal(true);
+              setError('Per usare la modalità personalizzata serve la chiave API Claude. Impostala e riprova.');
+              setPhase('error');
+              return;
+            }
+            try {
+              const validation = await validateCustomStrategy(commander, parsedData.customStrategy, apiKey);
+              initialData.customValidation = validation;
+              // Cerca di mappare la descrizione custom a un archetipo conosciuto per settare archetype
+              const archMatch = resolveArchetypeFromDescription(parsedData.customStrategy);
+              if (archMatch) initialData.archetype = archMatch;
+            } catch (e) {
+              console.error('Validation custom strategy failed:', e);
+            }
+          }
+
           setData(initialData);
           setPhase('confirm');
         } catch (e) {
@@ -5008,8 +5285,12 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
             <StepIndicator current={step} />
 
             {phase === 'input' && <InputStep onAnalyze={handleAnalyze} />}
-            {phase === 'fetching' && <LoadingScreen message={data?.archetypeMode === 'auto' ? "Recupero le carte e auto-rilevo l'archetipo…" : "Sto recuperando le carte da Scryfall…"} />}
-            {phase === 'confirm' && data && <ConfirmStep data={data} onConfirm={handleConfirm} onBack={handleReset} />}
+            {phase === 'fetching' && <LoadingScreen message={
+              data?.archetypeMode === 'auto' ? "Recupero le carte e auto-rilevo l'archetipo…" :
+              data?.archetypeMode === 'custom' ? "Recupero le carte e valido la tua strategia…" :
+              "Sto recuperando le carte da Scryfall…"
+            } />}
+            {phase === 'confirm' && data && <ConfirmStep data={data} onConfirm={handleConfirm} onBack={handleReset} onUpdateData={setData} />}
             {phase === 'analyzing' && <LoadingScreen message="Sto analizzando il mazzo…" />}
             {phase === 'results' && analysis && scores && (
               <ResultsView
@@ -5037,7 +5318,7 @@ Ordina dall'addizione più impattante (priority 10) alla meno (priority 1).`;
           />
 
           <footer className="max-w-6xl mx-auto mt-16 pt-6 border-t border-zinc-800 text-xs text-zinc-500 text-center">
-            v0.10 · Pacchetti tematici · Pool ibrido · Generator + Modifiche · Range archetipo
+            v0.11 · Input migliorato · Validazione strategia custom · Cambio commander · Pacchetti tematici
           </footer>
         </div>
       );
